@@ -55,6 +55,26 @@ hive ask --timeout 60 worker "what branch are you on?"
 
 ## Add a second host
 
+One command, over ssh:
+
+```sh
+hive node install vm1              # or user@host, any ssh alias works
+```
+
+That probes the target (`uname`), ships the right binary (self-copy on
+a matching platform, cross-compiles from the source tree otherwise),
+writes its config and network state over the ssh channel (tokens never
+appear in remote argv), starts the daemon, health-checks it from here,
+and announces the new host to every hub this one already knows.
+Defaults assume a tailnet: the node binds its tailscale IPv4 and dials
+back to ours; override with `--bind` / `--hub`. Useful flags:
+`--msg-only` (never ship the control token), `--restart` (upgrade a
+running node), `--no-start`, `--name`, `--port`, `--dest`, `--home`.
+The daemon is not persisted across reboots — add systemd/launchd if you
+need that.
+
+Or manually:
+
 ```sh
 # on vm1 (reachable over your tailnet):
 hive daemon --bind 100.x.y.z &
@@ -62,14 +82,18 @@ hive net join dev --hub mac:7777 --msg-token <T> --control-token <T>
 # hosts lists are local to each hub — tell each side about the other:
 hive hosts add mac 100.a.b.c:7777      # on vm1
 hive hosts add vm1 100.x.y.z:7777      # on mac
+```
 
+Either way:
+
+```sh
 hive agents                  # now shows agents on both hosts
 hive spawn --host vm1 bob -- claude    # control ops go direct to vm1's hub
 hive send bob@vm1 "hello from the mac"
 ```
 
-Join with only `--msg-token` to make a host (or agent) **msg-only**: it
-can talk, but can never control anyone.
+Join with only `--msg-token` (or install with `--msg-only`) to make a
+host **msg-only**: it can talk, but can never control anyone.
 
 ## Security model
 

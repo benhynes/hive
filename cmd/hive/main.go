@@ -44,6 +44,8 @@ func main() {
 		err = runAnswer(args)
 	case "hosts":
 		err = runHosts(args)
+	case "node":
+		err = runNode(args)
 	case "spawn":
 		err = runSpawn(args)
 	case "keys":
@@ -120,6 +122,9 @@ HOSTS (control layer)
   hive hosts list
   hive hosts add <name> <addr:port>
   hive hosts rm <name>
+  hive node install [--name N] [--bind IP] [--port N] [--hub A:P]
+                    [--msg-only] [--restart] [--no-start] <ssh-target>
+                                           bootstrap a new host over ssh
 
 CONTROL (control layer; goes direct to the target host)
   hive spawn [--host H] [--cwd D] [--grant-control] [--wait] <name> -- CMD...
