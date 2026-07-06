@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -47,7 +48,13 @@ func Resolve(netFlag string) (*Client, error) {
 		hc:    &http.Client{Timeout: 35 * time.Second},
 	}
 	if c.Addr == "" {
-		c.Addr = fmt.Sprintf("http://127.0.0.1:%d", cfg.Port)
+		// Mirror hSpawn's HIVE_ADDR logic: a daemon bound to a specific
+		// address (e.g. a tailnet IP) doesn't listen on loopback.
+		host := cfg.Bind
+		if host == "" || host == "0.0.0.0" || host == "::" {
+			host = "127.0.0.1"
+		}
+		c.Addr = "http://" + net.JoinHostPort(host, strconv.Itoa(cfg.Port))
 	}
 	if c.Net == "" {
 		c.Net = os.Getenv("HIVE_NET")
