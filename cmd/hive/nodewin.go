@@ -4,8 +4,9 @@ package main
 // shell, so every remote action runs as a PowerShell script passed via
 // -EncodedCommand (base64 UTF-16LE) — immune to the cmd/powershell
 // default-shell quoting maze — and files travel over scp/sftp instead
-// of stdin pipes. Windows hosts are message-only: the daemon, inboxes,
-// and discovery all work, but control ops need tmux.
+// of stdin pipes. Control ops (spawn/read/keys/kill) work through the
+// Windows console backend (internal/control); pass --msg-only to
+// withhold the control token.
 
 import (
 	"encoding/base64"
@@ -82,7 +83,11 @@ func nodeInstallWindows(ssh sshRunner, cfg config.Config, netName string, nc con
 	if o.name == cfg.HostName {
 		return fmt.Errorf("node would be named %q, same as this host — pass --name", o.name)
 	}
-	fmt.Printf("  windows/%s, node name %q — message-only host (control ops need tmux)\n", o.goarch, o.name)
+	layer := "control via the Windows console backend"
+	if o.msgOnly {
+		layer = "message-only (--msg-only)"
+	}
+	fmt.Printf("  windows/%s, node name %q — %s\n", o.goarch, o.name, layer)
 
 	profile, err := winPath(o.profile, "%USERPROFILE%")
 	if err != nil {
@@ -243,9 +248,12 @@ func nodeInstallWindows(ssh sshRunner, cfg config.Config, netName string, nc con
 		return err
 	}
 
-	fmt.Printf("\nnode %q is in the mesh (message-only — no tmux on Windows):\n", o.name)
+	fmt.Printf("\nnode %q is in the mesh:\n", o.name)
 	fmt.Printf("  hive agents                        # should reach @%s\n", o.name)
 	fmt.Printf("  hive send <agent>@%s ...\n", o.name)
+	if !o.msgOnly {
+		fmt.Printf("  hive spawn --host %s <name> -- CMD...\n", o.name)
+	}
 	if o.noStart {
 		fmt.Printf("  start it: ssh %s %s daemon --home %s\n", ssh.target, o.dest, o.home)
 	}

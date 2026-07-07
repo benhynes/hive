@@ -9,8 +9,8 @@ import (
 
 // runRegister registers the calling agent with the local hub and prints
 // export lines on stdout so a shell can `eval "$(hive register ...)"`.
-// Inside tmux the caller's pane is bound (nudgeable + controllable);
-// outside tmux the agent is message-only.
+// With a pane bound (tmux pane id on Unix, win:<pid> on Windows) the
+// agent is nudgeable + controllable; without one it is message-only.
 func runRegister(args []string) error {
 	fs := flags("register", args)
 	name := fs.String("name", "", "agent name (unique per host per network)")
@@ -35,7 +35,7 @@ func runRegister(args []string) error {
 	fmt.Printf("export HIVE_NET=%s\n", c.Net)
 	fmt.Printf("export HIVE_AGENT=%s\n", resp.Agent)
 	fmt.Printf("export HIVE_TOKEN=%s\n", resp.Token)
-	how := "message-only (no tmux pane bound)"
+	how := "message-only (no pane bound)"
 	if *pane != "" {
 		how = "controllable + nudgeable via pane " + *pane
 	}

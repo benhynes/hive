@@ -22,9 +22,9 @@ import (
 	"time"
 
 	"github.com/benhynes/hive/internal/config"
+	"github.com/benhynes/hive/internal/control"
 	"github.com/benhynes/hive/internal/proto"
 	"github.com/benhynes/hive/internal/store"
-	"github.com/benhynes/hive/internal/tmux"
 )
 
 // nudgeEvery is the minimum interval between nudge injections per agent.
@@ -174,21 +174,14 @@ func (h *Hub) from(id ident) string {
 
 // alive probes whether a registered agent is still what it was bound to.
 func alive(rec store.AgentRec) bool {
-	if rec.Pane != "" {
-		if !tmux.PaneExists(rec.Pane) {
-			return false
-		}
-		if rec.PID > 0 && rec.StartEpoch != "" {
-			ep, err := tmux.ProcStartEpoch(rec.PID)
-			return err == nil && ep == rec.StartEpoch
-		}
-		return true
+	if rec.Pane != "" && !control.PaneExists(rec.Pane) {
+		return false
 	}
 	if rec.PID > 0 && rec.StartEpoch != "" {
-		ep, err := tmux.ProcStartEpoch(rec.PID)
+		ep, err := control.ProcStartEpoch(rec.PID)
 		return err == nil && ep == rec.StartEpoch
 	}
-	return true // unbindable (no pane, no pid): trusted until deregistered
+	return true // unbindable (no pid epoch): trusted until deregistered
 }
 
 // deliverLocal appends an envelope to a local agent's inbox and fires the
@@ -233,11 +226,11 @@ func (h *Hub) maybeNudge(n *network, rec store.AgentRec, ib *store.Inbox) {
 	pane := rec.Pane
 	line := fmt.Sprintf("hive: %d new message(s) — run: hive recv", lag)
 	go func() {
-		if !tmux.PaneExists(pane) {
+		if !control.PaneExists(pane) {
 			return
 		}
-		if tmux.SendKeysLiteral(pane, line) == nil {
-			tmux.Enter(pane)
+		if control.SendKeysLiteral(pane, line) == nil {
+			control.Enter(pane)
 		}
 	}()
 }

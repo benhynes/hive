@@ -10,8 +10,8 @@ import (
 	"syscall"
 
 	"github.com/benhynes/hive/internal/config"
+	"github.com/benhynes/hive/internal/control"
 	"github.com/benhynes/hive/internal/hub"
-	"github.com/benhynes/hive/internal/tmux"
 )
 
 func main() {
@@ -54,6 +54,10 @@ func main() {
 		err = runRead(args)
 	case "kill":
 		err = runKill(args)
+	case "__conop":
+		// Hidden Windows console-op helper the daemon re-execs itself
+		// as; see internal/control/conop_windows.go.
+		err = control.RunConOp(args)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -77,7 +81,7 @@ func runDaemon(args []string) error {
 		os.Setenv("HIVE_HOME", *home)
 	}
 
-	if err := tmux.Available(); err != nil {
+	if err := control.Available(); err != nil {
 		fmt.Fprintln(os.Stderr, "hive: warning: "+err.Error()+" — control ops will fail")
 	}
 	cfg, err := config.Load()

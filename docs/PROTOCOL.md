@@ -96,11 +96,12 @@ bodies are capped at 64 KiB.
 `net join` to learn a peer's host name.
 
 ### `POST /register` `{name, pane?, pid?}`
-Binds identity for liveness: with `pane` (the caller's `$TMUX_PANE`)
-the hub verifies the pane, captures its root pid and the process
-start-epoch (`ps lstart`; process StartTime ticks on Windows) — the
-epoch check defeats pid reuse. With
-neither, the agent is message-only and trusted until deregistered.
+Binds identity for liveness: with `pane` (the caller's `$TMUX_PANE` on
+Unix, or `win:<pid>[:<creation>]` on Windows) the hub verifies the pane,
+captures its root pid and the process start-epoch (`ps lstart` on Unix,
+the process creation FILETIME on Windows) — the epoch check defeats pid
+reuse. With neither, the agent is message-only and trusted until
+deregistered.
 Rejects (409) names taken by a live agent; dead registrations are
 reclaimed. → `{agent, token}` (the per-agent token; shown once).
 

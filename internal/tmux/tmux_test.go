@@ -1,3 +1,5 @@
+//go:build !windows
+
 package tmux
 
 // These tests drive a real tmux server on a dedicated socket so the
@@ -135,9 +137,6 @@ func TestPaneLifecycle(t *testing.T) {
 	if epoch != epoch2 {
 		t.Fatalf("epoch changed: %q -> %q", epoch, epoch2)
 	}
-	if !Quiescent(pane, 100*time.Millisecond) {
-		t.Fatal("sleeping pane should be quiescent")
-	}
 	if err := KillSession("life"); err != nil {
 		t.Fatal(err)
 	}
@@ -147,26 +146,6 @@ func TestPaneLifecycle(t *testing.T) {
 	}
 	if PaneExists(pane) {
 		t.Fatal("pane survived kill")
-	}
-}
-
-// A dead pane must fail WaitQuiescent promptly instead of hot-spinning
-// tmux forks until the deadline.
-func TestWaitQuiescentDeadPane(t *testing.T) {
-	setup(t)
-	pane, err := NewSession("wq-dead", "", nil, []string{"cat"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := KillSession("wq-dead"); err != nil {
-		t.Fatal(err)
-	}
-	start := time.Now()
-	if WaitQuiescent(pane, 100*time.Millisecond, 10*time.Second) {
-		t.Fatal("dead pane reported quiescent")
-	}
-	if d := time.Since(start); d > 2*time.Second {
-		t.Fatalf("dead pane held WaitQuiescent for %v (want fast bail-out)", d)
 	}
 }
 

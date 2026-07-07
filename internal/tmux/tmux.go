@@ -1,5 +1,8 @@
-// Package tmux wraps the tmux CLI for hive's control layer. All calls
-// use exec arg vectors — no shell interpolation anywhere. Set
+//go:build !windows
+
+// Package tmux wraps the tmux CLI for hive's control layer on Unix
+// (internal/control is the OS seam; Windows uses the console API). All
+// calls use exec arg vectors — no shell interpolation anywhere. Set
 // HIVE_TMUX_SOCKET to use a dedicated server (tests do).
 package tmux
 
@@ -12,7 +15,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 )
 
 func args(rest ...string) []string {
@@ -206,18 +208,10 @@ func OpenWindow(session string) error {
 }
 
 // ProcStartEpoch returns a stable string identifying when pid started
-// (`ps -o lstart=` on macOS/Linux, process StartTime ticks on Windows).
-// Comparing it against the value captured at registration defeats pid
-// reuse.
+// (`ps -o lstart=`). Comparing it against the value captured at
+// registration defeats pid reuse.
 func ProcStartEpoch(pid int) (string, error) {
-	var out []byte
-	var err error
-	if runtime.GOOS == "windows" {
-		out, err = exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
-			fmt.Sprintf("(Get-Process -Id %d).StartTime.Ticks", pid)).Output()
-	} else {
-		out, err = exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
-	}
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
 	if err != nil {
 		return "", fmt.Errorf("pid %d gone", pid)
 	}
@@ -226,34 +220,4 @@ func ProcStartEpoch(pid int) (string, error) {
 		return "", fmt.Errorf("pid %d gone", pid)
 	}
 	return s, nil
-}
-
-// Quiescent reports whether the pane's content is unchanged across the
-// window — the readiness/idleness heuristic.
-func Quiescent(pane string, window time.Duration) bool {
-	a, err := Capture(pane, 0)
-	if err != nil {
-		return false
-	}
-	time.Sleep(window)
-	b, err := Capture(pane, 0)
-	return err == nil && a == b
-}
-
-// WaitQuiescent polls until the pane goes quiet or the deadline passes.
-// A vanished pane returns false immediately — without the existence
-// check a dead pane would make Quiescent fail before its sleep and
-// hot-spin tmux forks for the whole timeout.
-func WaitQuiescent(pane string, window, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if !PaneExists(pane) {
-			return false
-		}
-		if Quiescent(pane, window) {
-			return true
-		}
-		time.Sleep(50 * time.Millisecond) // guard against error-path spins
-	}
-	return false
 }

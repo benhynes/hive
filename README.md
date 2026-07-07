@@ -79,8 +79,10 @@ running node), `--no-start`, `--name`, `--port`, `--dest`, `--home`.
 detects the platform through cmd/PowerShell, ships `hive.exe` over
 scp, opens the daemon port in Windows Defender Firewall when the ssh
 user is admin, and pins state with `daemon --home`. Windows hosts are
-**message-only** — the daemon, inboxes, and discovery all work, but
-control ops need tmux.
+**full control peers** — where Unix drives sessions through tmux,
+Windows uses the classic console API (`internal/control`), so
+`spawn`/`read`/`keys`/`kill` work the same way. Pass `--msg-only` to
+withhold the control token. See [docs/windows-control.md](docs/windows-control.md).
 
 Or manually:
 

@@ -29,7 +29,13 @@ func runSpawn(args []string) error {
 		return err
 	}
 	fmt.Printf("spawned %s\n", res.Agent)
-	fmt.Printf("  session: %s (attach: tmux attach -t %s)\n", res.Session, res.Session)
+	if strings.HasPrefix(res.Pane, "win:") {
+		// Windows console sessions have no attach command; --headed (or
+		// later `hive spawn --headed`) is the way to see them.
+		fmt.Printf("  session: %s\n", res.Session)
+	} else {
+		fmt.Printf("  session: %s (attach: tmux attach -t %s)\n", res.Session, res.Session)
+	}
 	fmt.Printf("  pane:    %s\n", res.Pane)
 	if *waitReady {
 		fmt.Printf("  ready:   %v\n", res.Ready)
@@ -41,7 +47,7 @@ func runSpawn(args []string) error {
 		if res.Window == "opened" {
 			fmt.Printf("  window:  opened on the target host\n")
 		} else {
-			fmt.Printf("  window:  FAILED — %s (session still running; attach manually)\n",
+			fmt.Printf("  window:  FAILED — %s (session still running headless)\n",
 				strings.TrimPrefix(res.Window, "error: "))
 		}
 	}
@@ -105,9 +111,9 @@ func runKill(args []string) error {
 		return err
 	}
 	if killed {
-		fmt.Printf("killed %s (tmux session terminated, deregistered)\n", agent)
+		fmt.Printf("killed %s (session terminated, deregistered)\n", agent)
 	} else {
-		fmt.Printf("deregistered %s (no tmux session to kill)\n", agent)
+		fmt.Printf("deregistered %s (no live session to kill)\n", agent)
 	}
 	return nil
 }

@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -13,9 +14,9 @@ import (
 	"time"
 
 	"github.com/benhynes/hive/internal/config"
+	"github.com/benhynes/hive/internal/control"
 	"github.com/benhynes/hive/internal/proto"
 	"github.com/benhynes/hive/internal/store"
-	"github.com/benhynes/hive/internal/tmux"
 )
 
 // maxWait caps long-poll hold time per request.
@@ -174,24 +175,26 @@ func (h *Hub) hRegister(w http.ResponseWriter, r *http.Request, n *network, id i
 		return
 	}
 	rec := store.AgentRec{Name: req.Name, Registered: time.Now().UnixMilli()}
+	if err := control.AllowClientPane(req.Pane); err != nil {
+		httpErr(w, 400, "%v", err)
+		return
+	}
 	if req.Pane != "" {
-		if !tmux.PaneExists(req.Pane) {
-			httpErr(w, 400, "pane %s not found", req.Pane)
-			return
-		}
-		pid, err := tmux.PanePID(req.Pane)
+		// PanePID verifies liveness internally, so no separate existence
+		// probe is needed.
+		pid, err := control.PanePID(req.Pane)
 		if err != nil {
-			httpErr(w, 400, "pane pid: %v", err)
+			httpErr(w, 400, "pane %s: %v", req.Pane, err)
 			return
 		}
-		epoch, err := tmux.ProcStartEpoch(pid)
+		epoch, err := control.ProcStartEpoch(pid)
 		if err != nil {
 			httpErr(w, 400, "pane process gone")
 			return
 		}
 		rec.Pane, rec.PID, rec.StartEpoch = req.Pane, pid, epoch
 	} else if req.PID > 0 {
-		epoch, err := tmux.ProcStartEpoch(req.PID)
+		epoch, err := control.ProcStartEpoch(req.PID)
 		if err != nil {
 			httpErr(w, 400, "pid %d not found", req.PID)
 			return
@@ -622,7 +625,7 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 	if req.Headed {
 		// Best-effort: a spawn without a visible window is still a
 		// working spawn.
-		if err := tmux.OpenWindow(session); err != nil {
+		if err := control.OpenWindow(session, rec.Pane); err != nil {
 			window = "error: " + err.Error()
 		} else {
 			window = "opened"
@@ -631,7 +634,7 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 	ready := false
 	if req.WaitReady {
 		time.Sleep(500 * time.Millisecond) // let the process draw its first frame
-		ready = tmux.WaitQuiescent(rec.Pane, 700*time.Millisecond, 15*time.Second)
+		ready = control.WaitQuiescent(rec.Pane, 700*time.Millisecond, 15*time.Second)
 	}
 	writeJSON(w, 200, spawnResp{
 		Agent: rec.Name + "@" + h.Cfg.HostName, Session: rec.Session, Pane: rec.Pane,
@@ -650,15 +653,16 @@ func (h *Hub) claimAndSpawn(w http.ResponseWriter, r *http.Request, n *network, 
 		httpErr(w, 409, "name %q is taken by a live agent", req.Name)
 		return store.AgentRec{}, false
 	}
-	pane, err := tmux.NewSession(session, req.Cwd, env, req.Cmd)
-	if err != nil && strings.Contains(err.Error(), "duplicate session") {
+	pane, err := control.NewSession(session, req.Cwd, env, req.Cmd, req.Headed)
+	if errors.Is(err, control.ErrDuplicateSession) {
 		// Reclaim only a session this network's registry owns (a dead
 		// registration or crash leftover). tmux's session namespace is
 		// flat, so an unowned name may belong to another network or to
-		// something the user started — never kill those.
+		// something the user started — never kill those. (Windows spawns
+		// have no shared namespace and never collide.)
 		if old, ok := n.reg.Get(req.Name); ok && old.Session == session {
-			tmux.KillSession(session)
-			pane, err = tmux.NewSession(session, req.Cwd, env, req.Cmd)
+			control.KillSession(session, old.Pane)
+			pane, err = control.NewSession(session, req.Cwd, env, req.Cmd, req.Headed)
 		} else {
 			httpErr(w, 409, "tmux session %q exists but is not owned by network %q — kill it manually", session, n.name)
 			return store.AgentRec{}, false
@@ -668,15 +672,15 @@ func (h *Hub) claimAndSpawn(w http.ResponseWriter, r *http.Request, n *network, 
 		httpErr(w, 500, "spawn: %v", err)
 		return store.AgentRec{}, false
 	}
-	pid, err := tmux.PanePID(pane)
+	pid, err := control.PanePID(pane)
 	if err != nil {
-		tmux.KillSession(session)
+		control.KillSession(session, pane)
 		httpErr(w, 500, "spawn: %v", err)
 		return store.AgentRec{}, false
 	}
-	epoch, err := tmux.ProcStartEpoch(pid)
+	epoch, err := control.ProcStartEpoch(pid)
 	if err != nil {
-		tmux.KillSession(session)
+		control.KillSession(session, pane)
 		httpErr(w, 500, "spawned process died immediately")
 		return store.AgentRec{}, false
 	}
@@ -686,7 +690,7 @@ func (h *Hub) claimAndSpawn(w http.ResponseWriter, r *http.Request, n *network, 
 		Spawned: true, Registered: time.Now().UnixMilli(),
 	}
 	if err := n.reg.Put(rec); err != nil {
-		tmux.KillSession(session)
+		control.KillSession(session, pane)
 		httpErr(w, 500, "registry: %v", err)
 		return store.AgentRec{}, false
 	}
@@ -744,13 +748,13 @@ func (h *Hub) hKeys(w http.ResponseWriter, r *http.Request, n *network, id ident
 	var err error
 	if req.Text != "" {
 		if strings.ContainsAny(req.Text, "\n\r") {
-			err = tmux.Paste(rec.Pane, req.Text)
+			err = control.Paste(rec.Pane, req.Text)
 		} else {
-			err = tmux.SendKeysLiteral(rec.Pane, req.Text)
+			err = control.SendKeysLiteral(rec.Pane, req.Text)
 		}
 	}
 	if err == nil && req.Enter {
-		err = tmux.Enter(rec.Pane)
+		err = control.Enter(rec.Pane)
 	}
 	if err != nil {
 		httpErr(w, 500, "keys: %v", err)
@@ -767,7 +771,7 @@ func (h *Hub) hRead(w http.ResponseWriter, r *http.Request, n *network, id ident
 		return
 	}
 	lines, _ := strconv.Atoi(r.URL.Query().Get("lines"))
-	out, err := tmux.Capture(rec.Pane, lines)
+	out, err := control.Capture(rec.Pane, lines)
 	if err != nil {
 		httpErr(w, 500, "read: %v", err)
 		return
@@ -791,7 +795,7 @@ func (h *Hub) hKill(w http.ResponseWriter, r *http.Request, n *network, id ident
 	}
 	killed := false
 	if rec.Spawned && rec.Session != "" {
-		if err := tmux.KillSession(rec.Session); err == nil {
+		if err := control.KillSession(rec.Session, rec.Pane); err == nil {
 			killed = true
 		}
 	}
