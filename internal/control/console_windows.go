@@ -65,13 +65,40 @@ const (
 // Two helpers may legally attach to one console at once and interleave
 // WriteConsoleInput records or read mid-write; tmux serializes through
 // its server, and we serialize here.
-var paneLocks sync.Map // pane string -> *sync.Mutex
+//
+// Each entry is reference-counted and dropped when its last holder
+// releases, so the map is bounded by the number of panes with an op
+// in flight — not by the total spawns over the daemon's lifetime
+// (every spawn mints a unique win:<pid>:<creation> pane).
+type paneLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+var (
+	paneLocksMu sync.Mutex
+	paneLocks   = map[string]*paneLock{}
+)
 
 func lockPane(pane string) func() {
-	m, _ := paneLocks.LoadOrStore(pane, &sync.Mutex{})
-	mu := m.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+	paneLocksMu.Lock()
+	pl := paneLocks[pane]
+	if pl == nil {
+		pl = &paneLock{}
+		paneLocks[pane] = pl
+	}
+	pl.refs++ // pin the entry so a concurrent releaser can't evict it
+	paneLocksMu.Unlock()
+
+	pl.mu.Lock() // block outside paneLocksMu — a console op can be slow
+	return func() {
+		pl.mu.Unlock()
+		paneLocksMu.Lock()
+		if pl.refs--; pl.refs == 0 {
+			delete(paneLocks, pane)
+		}
+		paneLocksMu.Unlock()
+	}
 }
 
 // Available reports whether control ops can work here. The console API
