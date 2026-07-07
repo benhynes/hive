@@ -231,9 +231,21 @@ func nodeInstallWindows(ssh sshRunner, cfg config.Config, netName string, nc con
 			fmt.Println("daemon already running — the old binary stays in memory (pass --restart to upgrade)")
 		} else {
 			// --restart already stopped it above (before the binary swap).
+			//
+			// Launch detached via WMI, not Start-Process: Windows OpenSSH
+			// terminates the session's whole process tree on disconnect,
+			// so a hidden Start-Process child dies the moment this install
+			// closes its ssh connection. Win32_Process.Create runs the
+			// process from the WMI service, outside the ssh session's job,
+			// so a non-persist daemon outlives the install. cmd wraps it
+			// for stdout/stderr redirection; the winPath-validated paths
+			// have no spaces or quotes, so they pass unquoted and avoid
+			// the `cmd /c` leading-quote rule.
+			cmdLine := fmt.Sprintf(`cmd /c %s daemon --home %s > %s 2> %s`,
+				o.dest, o.home, o.home+`\daemon.log`, o.home+`\daemon.err`)
 			start := fmt.Sprintf(
-				`Start-Process -WindowStyle Hidden -FilePath %s -ArgumentList 'daemon','--home',%s -RedirectStandardOutput %s -RedirectStandardError %s`,
-				q(o.dest), q(o.home), q(o.home+`\daemon.log`), q(o.home+`\daemon.err`))
+				`try { $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=%s} -ErrorAction Stop } catch { Write-Output $_.Exception.Message; exit 1 }; if ($r.ReturnValue -ne 0) { Write-Output ('Win32_Process.Create returned ' + $r.ReturnValue); exit 1 }`,
+				q(cmdLine))
 			if _, err := ssh.run(nil, winPS(start)); err != nil {
 				return err
 			}
@@ -255,7 +267,11 @@ func nodeInstallWindows(ssh sshRunner, cfg config.Config, netName string, nc con
 		fmt.Printf("  hive spawn --host %s <name> -- CMD...\n", o.name)
 	}
 	if o.noStart {
-		fmt.Printf("  start it: ssh %s %s daemon --home %s\n", ssh.target, o.dest, o.home)
+		// A plain `ssh <host> hive daemon` runs in the foreground and dies
+		// when that ssh session closes (OpenSSH kills the session tree);
+		// launch it detached, or rerun install without --no-start.
+		fmt.Printf("  start it (detached): ssh %s powershell -Command \"Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='cmd /c %s daemon --home %s'}\"\n",
+			ssh.target, o.dest, o.home)
 	}
 	if !o.persist {
 		fmt.Printf("note: the daemon is not persisted across reboots (rerun with --persist)\n")
