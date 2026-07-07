@@ -122,7 +122,7 @@ HOSTS (control layer)
   hive hosts list
   hive hosts add <name> <addr:port>
   hive hosts rm <name>
-  hive node install [--name N] [--bind IP] [--port N] [--hub A:P]
+  hive node install [--name N] [--bind IP] [--port N] [--hub A:P] [--persist]
                     [--msg-only] [--restart] [--no-start] <ssh-target>
                                            bootstrap a new host over ssh
 

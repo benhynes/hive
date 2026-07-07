@@ -45,6 +45,7 @@ func nodeInstall(args []string) error {
 	bin := fs.String("bin", "", "prebuilt binary to ship (default: self-copy, or cross-compile from --src)")
 	src := fs.String("src", ".", "hive source dir for cross-compiling")
 	msgOnly := fs.Bool("msg-only", false, "don't ship the control token (node can never control anyone)")
+	persist := fs.Bool("persist", false, "install a systemd (Linux) or launchd (macOS) service so the daemon survives reboots")
 	noStart := fs.Bool("no-start", false, "install and configure only; don't start the daemon")
 	restart := fs.Bool("restart", false, "restart the node's daemon if one is already running (upgrades)")
 	noAnnounce := fs.Bool("no-announce", false, "don't add the node to the other hubs' hosts lists")
@@ -181,7 +182,30 @@ func nodeInstall(args []string) error {
 
 	// 6. Start (or restart) the daemon and verify it from here.
 	nodeURL := "http://" + net.JoinHostPort(*bind, strconv.Itoa(*port))
-	if !*noStart {
+	waitHealthy := func() error {
+		deadline := time.Now().Add(8 * time.Second)
+		for !healthOK(nodeURL) {
+			if time.Now().After(deadline) {
+				return fmt.Errorf("node daemon never became healthy at %s — check: ssh %s tail %s/daemon.log",
+					nodeURL, target, homePath)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		fmt.Printf("daemon healthy at %s\n", nodeURL)
+		return nil
+	}
+	if *persist {
+		desc, err := persistNode(ssh, goos, destPath, homePath, !*noStart)
+		if err != nil {
+			return err
+		}
+		fmt.Println("persistence: " + desc)
+		if !*noStart {
+			if err := waitHealthy(); err != nil {
+				return err
+			}
+		}
+	} else if !*noStart {
 		running := healthOK(nodeURL)
 		if running && !*restart {
 			fmt.Println("daemon already running — the old binary stays in memory (pass --restart to upgrade)")
@@ -195,15 +219,9 @@ func nodeInstall(args []string) error {
 			if _, err := ssh.run(nil, startCmd); err != nil {
 				return err
 			}
-			deadline := time.Now().Add(5 * time.Second)
-			for !healthOK(nodeURL) {
-				if time.Now().After(deadline) {
-					return fmt.Errorf("node daemon never became healthy at %s — check: ssh %s tail %s/daemon.log",
-						nodeURL, target, homePath)
-				}
-				time.Sleep(100 * time.Millisecond)
+			if err := waitHealthy(); err != nil {
+				return err
 			}
-			fmt.Printf("daemon healthy at %s\n", nodeURL)
 		}
 	}
 
@@ -240,8 +258,136 @@ func nodeInstall(args []string) error {
 	if *noStart {
 		fmt.Printf("  start it: ssh %s '%s daemon'   (HIVE_HOME=%s if non-default)\n", target, destPath, homePath)
 	}
-	fmt.Printf("note: the daemon is not persisted across reboots (add systemd/launchd yourself if needed)\n")
+	if !*persist {
+		fmt.Printf("note: the daemon is not persisted across reboots (rerun with --persist)\n")
+	}
 	return nil
+}
+
+const systemdSystemUnit = `[Unit]
+Description=hive agent mesh daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=%s
+Environment=HIVE_HOME=%s
+ExecStart=%s daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+`
+
+const systemdUserUnit = `[Unit]
+Description=hive agent mesh daemon
+After=network-online.target
+
+[Service]
+Environment=HIVE_HOME=%s
+ExecStart=%s daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+`
+
+const launchdPlist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.hive.daemon</string>
+  <key>ProgramArguments</key><array><string>%s</string><string>daemon</string></array>
+  <key>EnvironmentVariables</key><dict><key>HIVE_HOME</key><string>%s</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>%s/daemon.log</string>
+  <key>StandardErrorPath</key><string>%s/daemon.log</string>
+</dict></plist>
+`
+
+// persistNode installs a supervisor for the node's daemon and (when
+// startNow) hands the running daemon over to it. Unit files need
+// absolute paths, so the node's $HOME is resolved first.
+func persistNode(ssh sshRunner, goos, dest, home string, startNow bool) (string, error) {
+	out, err := ssh.run(nil, `sh -c 'echo "$HOME"'`)
+	if err != nil {
+		return "", err
+	}
+	absHome := strings.TrimSpace(out)
+	if absHome == "" || !strings.HasPrefix(absHome, "/") {
+		return "", fmt.Errorf("cannot resolve the node's $HOME (got %q)", absHome)
+	}
+	abs := func(p string) string { return strings.ReplaceAll(p, "$HOME", absHome) }
+	if goos == "darwin" {
+		return persistLaunchd(ssh, abs(dest), abs(home))
+	}
+	return persistSystemd(ssh, abs(dest), abs(home), startNow)
+}
+
+func persistSystemd(ssh sshRunner, dest, home string, startNow bool) (string, error) {
+	if out, _ := ssh.run(nil, `sh -c '[ -d /run/systemd/system ] && command -v systemctl >/dev/null && echo yes || true'`); !strings.Contains(out, "yes") {
+		return "", fmt.Errorf("--persist needs systemd on the node (not running there); start the daemon your own way or drop --persist")
+	}
+	out, err := ssh.run(nil, `sh -c 'if [ "$(id -u)" = 0 ]; then echo root; elif sudo -n true 2>/dev/null; then echo sudo; else echo user; fi; id -un'`)
+	if err != nil {
+		return "", err
+	}
+	f := strings.Fields(out)
+	if len(f) < 2 {
+		return "", fmt.Errorf("privilege probe returned %q", out)
+	}
+	mode, user := f[0], f[1]
+
+	now := ""
+	if startNow {
+		now = " --now"
+	}
+	if mode == "user" {
+		unit := fmt.Sprintf(systemdUserUnit, home, dest)
+		if err := writeRemote(ssh, "$HOME/.config/systemd/user", "$HOME/.config/systemd/user/hive.service", []byte(unit)); err != nil {
+			return "", err
+		}
+		script := fmt.Sprintf(
+			`sh -c 'set -e; export XDG_RUNTIME_DIR="/run/user/$(id -u)"; systemctl --user daemon-reload; pkill -f "[h]ive daemon" 2>/dev/null || true; systemctl --user enable%s hive; loginctl enable-linger "$(id -un)" 2>/dev/null || true'`, now)
+		if _, err := ssh.run(nil, script); err != nil {
+			return "", err
+		}
+		desc := "systemd user unit (~/.config/systemd/user/hive.service)"
+		if lo, _ := ssh.run(nil, `sh -c 'loginctl show-user "$(id -un)" -p Linger 2>/dev/null || true'`); !strings.Contains(lo, "Linger=yes") {
+			desc += " — WARNING: lingering is off, so it only runs while you're logged in (a root shell can fix it: loginctl enable-linger " + user + ")"
+		}
+		return desc, nil
+	}
+
+	pre := ""
+	if mode == "sudo" {
+		pre = "sudo "
+	}
+	unit := fmt.Sprintf(systemdSystemUnit, user, home, dest)
+	if err := writeRemote(ssh, "/tmp", "/tmp/hive.service.tmp", []byte(unit)); err != nil {
+		return "", err
+	}
+	script := fmt.Sprintf(
+		`sh -c 'set -e; %smv /tmp/hive.service.tmp /etc/systemd/system/hive.service; %schmod 644 /etc/systemd/system/hive.service; %ssystemctl daemon-reload; pkill -f "[h]ive daemon" 2>/dev/null || true; %ssystemctl enable%s hive'`,
+		pre, pre, pre, pre, now)
+	if _, err := ssh.run(nil, script); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("systemd system unit (/etc/systemd/system/hive.service, User=%s, via %s)", user, mode), nil
+}
+
+func persistLaunchd(ssh sshRunner, dest, home string) (string, error) {
+	plist := fmt.Sprintf(launchdPlist, dest, home, home, home)
+	if err := writeRemote(ssh, "$HOME/Library/LaunchAgents", "$HOME/Library/LaunchAgents/com.hive.daemon.plist", []byte(plist)); err != nil {
+		return "", err
+	}
+	script := `sh -c 'set -e; pkill -f "[h]ive daemon" 2>/dev/null || true; launchctl bootout "gui/$(id -u)/com.hive.daemon" 2>/dev/null || true; launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.hive.daemon.plist" 2>/dev/null || launchctl load -w "$HOME/Library/LaunchAgents/com.hive.daemon.plist"'`
+	if _, err := ssh.run(nil, script); err != nil {
+		return "", fmt.Errorf("%v — a LaunchAgent needs a logged-in user session; it will activate at next login", err)
+	}
+	return "launchd agent (~/Library/LaunchAgents/com.hive.daemon.plist)", nil
 }
 
 // resolveNetConfig picks the network like client.Resolve does (flag,

@@ -68,10 +68,11 @@ appear in remote argv), starts the daemon, health-checks it from here,
 and announces the new host to every hub this one already knows.
 Defaults assume a tailnet: the node binds its tailscale IPv4 and dials
 back to ours; override with `--bind` / `--hub`. Useful flags:
+`--persist` (install a supervisor so the daemon survives crashes and
+reboots — a systemd unit on Linux, system-wide when root/sudo allows,
+else a user unit with best-effort lingering; a launchd agent on macOS),
 `--msg-only` (never ship the control token), `--restart` (upgrade a
 running node), `--no-start`, `--name`, `--port`, `--dest`, `--home`.
-The daemon is not persisted across reboots — add systemd/launchd if you
-need that.
 
 Or manually:
 
