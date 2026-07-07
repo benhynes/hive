@@ -13,17 +13,18 @@ func runSpawn(args []string) error {
 	cwd := fs.String("cwd", "", "working directory for the spawned process")
 	grant := fs.Bool("grant-control", false, "inject the network control token (CONTROL layer)")
 	waitReady := fs.Bool("wait", false, "wait until the pane draws and goes quiet")
+	headed := fs.Bool("headed", false, "open a visible terminal window on the target host attached to the session")
 	fs.Parse2()
 	name := fs.pos(0)
 	cmd := fs.afterDD
 	if name == "" || len(cmd) == 0 {
-		return fmt.Errorf("usage: hive spawn [--host H] [--cwd D] [--grant-control] [--wait] <name> -- CMD...")
+		return fmt.Errorf("usage: hive spawn [--host H] [--cwd D] [--grant-control] [--wait] [--headed] <name> -- CMD...")
 	}
 	c, err := client.Resolve(*fs.net)
 	if err != nil {
 		return err
 	}
-	res, err := c.Spawn(*host, name, cmd, *cwd, *grant, *waitReady)
+	res, err := c.Spawn(*host, name, cmd, *cwd, *grant, *waitReady, *headed)
 	if err != nil {
 		return err
 	}
@@ -35,6 +36,14 @@ func runSpawn(args []string) error {
 	}
 	if *grant {
 		fmt.Printf("  control: granted (HIVE_CONTROL_TOKEN injected)\n")
+	}
+	if *headed {
+		if res.Window == "opened" {
+			fmt.Printf("  window:  opened on the target host\n")
+		} else {
+			fmt.Printf("  window:  FAILED — %s (session still running; attach manually)\n",
+				strings.TrimPrefix(res.Window, "error: "))
+		}
 	}
 	return nil
 }

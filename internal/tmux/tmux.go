@@ -151,6 +151,60 @@ func KillSession(session string) error {
 	return err
 }
 
+// attachArgv is the command a human terminal runs to attach to session,
+// honoring HIVE_TMUX_SOCKET.
+func attachArgv(session string) []string {
+	return append([]string{"tmux"}, args("attach-session", "-t", session)...)
+}
+
+// OpenWindow opens a terminal window on this host attached to the
+// session — the "headed" spawn. Requires the daemon to run inside a
+// GUI session (macOS user session, or DISPLAY/WAYLAND_DISPLAY set).
+func OpenWindow(session string) error {
+	argv := attachArgv(session)
+	if runtime.GOOS == "darwin" {
+		// Terminal.app via AppleScript: works without accessibility
+		// permissions and reliably creates a visible window.
+		script := fmt.Sprintf("tell application \"Terminal\"\nactivate\ndo script %q\nend tell",
+			strings.Join(argv, " "))
+		if out, err := exec.Command("osascript", "-e", script).CombinedOutput(); err != nil {
+			return fmt.Errorf("osascript: %v: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	if os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
+		return fmt.Errorf("no DISPLAY/WAYLAND_DISPLAY in the daemon's environment")
+	}
+	type term struct {
+		bin  string
+		args []string
+	}
+	var candidates []term
+	if t := os.Getenv("TERMINAL"); t != "" {
+		candidates = append(candidates, term{t, []string{"-e"}})
+	}
+	candidates = append(candidates,
+		term{"x-terminal-emulator", []string{"-e"}},
+		term{"gnome-terminal", []string{"--"}},
+		term{"konsole", []string{"-e"}},
+		term{"kitty", []string{"-e"}},
+		term{"alacritty", []string{"-e"}},
+		term{"xterm", []string{"-e"}},
+	)
+	for _, c := range candidates {
+		if _, err := exec.LookPath(c.bin); err != nil {
+			continue
+		}
+		cmd := exec.Command(c.bin, append(c.args, argv...)...)
+		if err := cmd.Start(); err != nil {
+			continue
+		}
+		go cmd.Wait() // reap when the window closes
+		return nil
+	}
+	return fmt.Errorf("no terminal emulator found (tried $TERMINAL, x-terminal-emulator, gnome-terminal, konsole, kitty, alacritty, xterm)")
+}
+
 // ProcStartEpoch returns a stable string identifying when pid started
 // (`ps -o lstart=` on macOS/Linux, process StartTime ticks on Windows).
 // Comparing it against the value captured at registration defeats pid

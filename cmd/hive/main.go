@@ -131,7 +131,7 @@ HOSTS (control layer)
                                            bootstrap a new host over ssh
 
 CONTROL (control layer; goes direct to the target host)
-  hive spawn [--host H] [--cwd D] [--grant-control] [--wait] <name> -- CMD...
+  hive spawn [--host H] [--cwd D] [--grant-control] [--wait] [--headed] <name> -- CMD...
   hive keys [--enter] <agent> <text...>
   hive read [--lines N] <agent>
   hive kill <agent>

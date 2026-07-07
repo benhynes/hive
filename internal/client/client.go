@@ -411,9 +411,10 @@ type SpawnResp struct {
 	Session string `json:"session"`
 	Pane    string `json:"pane"`
 	Ready   bool   `json:"ready"`
+	Window  string `json:"window,omitempty"`
 }
 
-func (c *Client) Spawn(host, name string, cmd []string, cwd string, grantControl, waitReady bool) (SpawnResp, error) {
+func (c *Client) Spawn(host, name string, cmd []string, cwd string, grantControl, waitReady, headed bool) (SpawnResp, error) {
 	tok, err := c.controlToken()
 	if err != nil {
 		return SpawnResp{}, err
@@ -430,7 +431,7 @@ func (c *Client) Spawn(host, name string, cmd []string, cwd string, grantControl
 	var out SpawnResp
 	err = c.do("POST", base, c.np("/spawn"), tok, map[string]any{
 		"name": name, "cmd": cmd, "cwd": cwd,
-		"grant_control": grantControl, "wait_ready": waitReady,
+		"grant_control": grantControl, "wait_ready": waitReady, "headed": headed,
 	}, &out)
 	return out, err
 }

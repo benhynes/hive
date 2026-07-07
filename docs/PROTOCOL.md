@@ -131,13 +131,18 @@ Agents ack only their own inbox.
 ### `GET/POST /hosts` `{op: add|rm, name, addr}`
 Read (any token) / mutate (control) this hub's local hosts list.
 
-### `POST /spawn` `{name, cmd[], cwd?, grant_control?, wait_ready?}`
+### `POST /spawn` `{name, cmd[], cwd?, grant_control?, wait_ready?, headed?}`
 Creates tmux session `hive-<net>-<name>` via `new-session -d -e ...`
 (env injected by tmux, never shell-interpolated), registers the agent
 bound to its pane, and injects `HIVE_ADDR/HIVE_NET/HIVE_AGENT/
 HIVE_TOKEN` (+ `HIVE_CONTROL_TOKEN` with `grant_control`).
-`wait_ready` polls until the pane stops changing (≤15 s).
-→ `{agent, session, pane, ready}`.
+`wait_ready` polls until the pane stops changing (≤15 s). `headed`
+opens a visible terminal window on the target host attached to the
+session (Terminal.app on macOS; `$TERMINAL` or a common emulator on
+Linux) — best-effort: it needs the daemon to run inside a GUI session,
+and failure never fails the spawn.
+→ `{agent, session, pane, ready, window?}` — `window` is `"opened"` or
+the error when `headed` was requested.
 
 ### `POST /keys` `{agent, text, enter?}`
 Types into the agent's pane: `send-keys -l` for single-line text,

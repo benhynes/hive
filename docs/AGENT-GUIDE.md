@@ -59,6 +59,8 @@ the keyboard could do, and every action is audit-logged.
 ```sh
 hive spawn --host vm1 --wait worker -- claude   # new tmux'd agent on vm1
 hive spawn --grant-control lead -- claude       # a controller agent
+hive spawn --headed pair -- claude              # + a visible terminal window
+                                                #   so the human can watch
 hive read worker@vm1                            # its screen, as text
 hive read --lines 500 worker@vm1                # + scrollback
 hive keys --enter worker@vm1 "run the tests"    # type + Enter

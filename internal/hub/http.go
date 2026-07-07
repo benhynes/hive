@@ -566,6 +566,7 @@ type spawnReq struct {
 	Cwd          string   `json:"cwd,omitempty"`
 	GrantControl bool     `json:"grant_control,omitempty"`
 	WaitReady    bool     `json:"wait_ready,omitempty"`
+	Headed       bool     `json:"headed,omitempty"` // open a visible terminal window attached to the session
 }
 
 type spawnResp struct {
@@ -573,6 +574,7 @@ type spawnResp struct {
 	Session string `json:"session"`
 	Pane    string `json:"pane"`
 	Ready   bool   `json:"ready"`
+	Window  string `json:"window,omitempty"` // headed result: "opened" or the error
 }
 
 func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id ident) {
@@ -616,13 +618,24 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 	if !ok {
 		return
 	}
+	window := ""
+	if req.Headed {
+		// Best-effort: a spawn without a visible window is still a
+		// working spawn.
+		if err := tmux.OpenWindow(session); err != nil {
+			window = "error: " + err.Error()
+		} else {
+			window = "opened"
+		}
+	}
 	ready := false
 	if req.WaitReady {
 		time.Sleep(500 * time.Millisecond) // let the process draw its first frame
 		ready = tmux.WaitQuiescent(rec.Pane, 700*time.Millisecond, 15*time.Second)
 	}
 	writeJSON(w, 200, spawnResp{
-		Agent: rec.Name + "@" + h.Cfg.HostName, Session: rec.Session, Pane: rec.Pane, Ready: ready,
+		Agent: rec.Name + "@" + h.Cfg.HostName, Session: rec.Session, Pane: rec.Pane,
+		Ready: ready, Window: window,
 	})
 }
 
@@ -678,7 +691,7 @@ func (h *Hub) claimAndSpawn(w http.ResponseWriter, r *http.Request, n *network, 
 		return store.AgentRec{}, false
 	}
 	n.auditLine(h.actor(r, id), "spawn", rec.Name+"@"+h.Cfg.HostName,
-		fmt.Sprintf("cmd=%q grant_control=%v", strings.Join(req.Cmd, " "), req.GrantControl))
+		fmt.Sprintf("cmd=%q grant_control=%v headed=%v", strings.Join(req.Cmd, " "), req.GrantControl, req.Headed))
 	return rec, true
 }
 

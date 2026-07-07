@@ -139,7 +139,7 @@ hive answer <ask-id> <body...>
 
 # CONTROL layer (direct to the target host's hub)
 hive hosts  list | add <name> <addr:port> | rm <name>
-hive spawn [--host H] [--cwd D] [--grant-control] [--wait] <name> -- CMD...
+hive spawn [--host H] [--cwd D] [--grant-control] [--wait] [--headed] <name> -- CMD...
 hive keys [--enter] <agent> <text...>
 hive read [--lines N] <agent>
 hive kill <agent>
