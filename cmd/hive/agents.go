@@ -51,9 +51,13 @@ func runAgents(args []string) error {
 	return nil
 }
 
-// ago renders a unix-millisecond timestamp as a coarse age.
+// ago renders a unix-millisecond timestamp as a coarse age. Remote
+// hosts' clocks may run ahead of ours; never show a negative age.
 func ago(ms int64) string {
 	d := time.Since(time.UnixMilli(ms))
+	if d < 0 {
+		d = 0
+	}
 	switch {
 	case d < time.Minute:
 		return fmt.Sprintf("%ds", int(d.Seconds()))

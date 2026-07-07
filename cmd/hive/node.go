@@ -40,12 +40,12 @@ func nodeInstall(args []string) error {
 	bind := fs.String("bind", "", "address the node's daemon binds (default: its tailscale IPv4)")
 	port := fs.Int("port", 7777, "node's daemon port")
 	hubAddr := fs.String("hub", "", "this hub's addr:port as reachable FROM the node (default: local tailscale IPv4 + local port)")
-	dest := fs.String("dest", "$HOME/.local/bin/hive", "remote path for the binary")
-	home := fs.String("home", "$HOME/.hive", "remote hive state dir")
+	dest := fs.String("dest", "", "remote path for the binary (default: ~/.local/bin/hive; %USERPROFILE%\\.hive\\bin\\hive.exe on Windows)")
+	home := fs.String("home", "", "remote hive state dir (default: ~/.hive)")
 	bin := fs.String("bin", "", "prebuilt binary to ship (default: self-copy, or cross-compile from --src)")
 	src := fs.String("src", ".", "hive source dir for cross-compiling")
 	msgOnly := fs.Bool("msg-only", false, "don't ship the control token (node can never control anyone)")
-	persist := fs.Bool("persist", false, "install a systemd (Linux) or launchd (macOS) service so the daemon survives reboots")
+	persist := fs.Bool("persist", false, "install a supervisor: systemd (Linux), launchd (macOS), or a boot scheduled task (Windows)")
 	noStart := fs.Bool("no-start", false, "install and configure only; don't start the daemon")
 	restart := fs.Bool("restart", false, "restart the node's daemon if one is already running (upgrades)")
 	noAnnounce := fs.Bool("no-announce", false, "don't add the node to the other hubs' hosts lists")
@@ -53,17 +53,6 @@ func nodeInstall(args []string) error {
 	target := fs.pos(0)
 	if target == "" {
 		return fmt.Errorf("usage: hive node install [flags] <ssh-target>   (flags before the target)")
-	}
-	destPath, err := remotePath(*dest)
-	if err != nil {
-		return err
-	}
-	homePath, err := remotePath(*home)
-	if err != nil {
-		return err
-	}
-	if !strings.Contains(destPath, "/") {
-		return fmt.Errorf("--dest must be a path, got %q", destPath)
 	}
 
 	cfg, err := config.Load()
@@ -83,9 +72,24 @@ func nodeInstall(args []string) error {
 
 	// 1. What are we installing onto?
 	fmt.Printf("probing %s ...\n", target)
-	out, err := ssh.run(nil, `uname -s -n -m`)
-	if err != nil {
-		return err
+	out, uerr := ssh.run(nil, `uname -s -n -m`)
+	if uerr != nil {
+		// No POSIX shell — Windows OpenSSH (cmd or powershell default
+		// shell) answers this probe instead.
+		if wout, werr := ssh.run(nil, `cmd /c "echo %OS% %COMPUTERNAME% %PROCESSOR_ARCHITECTURE% %USERPROFILE%"`); werr == nil {
+			comp, arch, profile, perr := parseWinProbe(wout)
+			if perr != nil {
+				return fmt.Errorf("target answers cmd but not a usable Windows probe: %v", perr)
+			}
+			return nodeInstallWindows(ssh, cfg, netName, nc, winOpts{
+				name: *name, bind: *bind, hub: *hubAddr, dest: *dest, home: *home,
+				bin: *bin, src: *src, port: *port,
+				msgOnly: *msgOnly, persist: *persist, noStart: *noStart,
+				restart: *restart, noAnnounce: *noAnnounce,
+				computer: comp, goarch: arch, profile: profile,
+			})
+		}
+		return uerr
 	}
 	f := strings.Fields(out)
 	if len(f) < 3 {
@@ -106,6 +110,23 @@ func nodeInstall(args []string) error {
 		return fmt.Errorf("node would be named %q, same as this host — pass --name", *name)
 	}
 	fmt.Printf("  %s/%s, node name %q\n", goos, goarch, *name)
+	if *dest == "" {
+		*dest = "$HOME/.local/bin/hive"
+	}
+	if *home == "" {
+		*home = "$HOME/.hive"
+	}
+	destPath, err := remotePath(*dest)
+	if err != nil {
+		return err
+	}
+	homePath, err := remotePath(*home)
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(destPath, "/") {
+		return fmt.Errorf("--dest must be a path, got %q", destPath)
+	}
 
 	// 2. Get a binary for that platform.
 	binPath := *bin
@@ -145,20 +166,11 @@ func nodeInstall(args []string) error {
 	if net.ParseIP(*bind) == nil {
 		return fmt.Errorf("bad --bind %q (want an IP address)", *bind)
 	}
-	if *hubAddr == "" {
-		ip := tailnetIPLocal()
-		if ip == "" {
-			return fmt.Errorf("cannot detect this host's tailscale IPv4 — pass --hub ADDR:PORT")
-		}
-		*hubAddr = net.JoinHostPort(ip, strconv.Itoa(cfg.Port))
+	hub, err := resolveHubAddr(cfg, *hubAddr)
+	if err != nil {
+		return err
 	}
-	if _, _, err := net.SplitHostPort(*hubAddr); err != nil {
-		return fmt.Errorf("bad --hub %q: %v", *hubAddr, err)
-	}
-	if cfg.Bind == "127.0.0.1" || cfg.Bind == "::1" {
-		fmt.Printf("WARNING: this host's daemon binds %s — the node cannot reach it.\n", cfg.Bind)
-		fmt.Printf("         restart it with: hive daemon --bind %s\n", strings.Split(*hubAddr, ":")[0])
-	}
+	warnLoopbackHub(cfg, hub)
 
 	// 5. Write the node's config and network state over the ssh channel.
 	fmt.Printf("configuring: host_name=%s bind=%s port=%d net=%s msg_only=%v\n",
@@ -170,7 +182,7 @@ func nodeInstall(args []string) error {
 	nodeNet := config.NetConfig{
 		Name:     netName,
 		MsgToken: nc.MsgToken,
-		Hosts:    seedHosts(nc.Hosts, cfg.HostName, *hubAddr, *name, *port),
+		Hosts:    seedHosts(nc.Hosts, cfg.HostName, hub, *name, *port),
 	}
 	if !*msgOnly {
 		nodeNet.ControlToken = nc.ControlToken
@@ -182,18 +194,7 @@ func nodeInstall(args []string) error {
 
 	// 6. Start (or restart) the daemon and verify it from here.
 	nodeURL := "http://" + net.JoinHostPort(*bind, strconv.Itoa(*port))
-	waitHealthy := func() error {
-		deadline := time.Now().Add(8 * time.Second)
-		for !healthOK(nodeURL) {
-			if time.Now().After(deadline) {
-				return fmt.Errorf("node daemon never became healthy at %s — check: ssh %s tail %s/daemon.log",
-					nodeURL, target, homePath)
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-		fmt.Printf("daemon healthy at %s\n", nodeURL)
-		return nil
-	}
+	hint := fmt.Sprintf("ssh %s tail %s/daemon.log", target, homePath)
 	if *persist {
 		desc, err := persistNode(ssh, goos, destPath, homePath, !*noStart)
 		if err != nil {
@@ -201,7 +202,7 @@ func nodeInstall(args []string) error {
 		}
 		fmt.Println("persistence: " + desc)
 		if !*noStart {
-			if err := waitHealthy(); err != nil {
+			if err := waitHealthy(nodeURL, hint); err != nil {
 				return err
 			}
 		}
@@ -219,7 +220,7 @@ func nodeInstall(args []string) error {
 			if _, err := ssh.run(nil, startCmd); err != nil {
 				return err
 			}
-			if err := waitHealthy(); err != nil {
+			if err := waitHealthy(nodeURL, hint); err != nil {
 				return err
 			}
 		}
@@ -227,29 +228,8 @@ func nodeInstall(args []string) error {
 
 	// 7. Tell every hub we know (including our own) about the new host.
 	nodeAddr := net.JoinHostPort(*bind, strconv.Itoa(*port))
-	if !*noAnnounce && nc.ControlToken != "" {
-		for host, addr := range nc.Hosts {
-			if host == *name {
-				continue
-			}
-			err := postHostsAdd(addr, netName, nc.ControlToken, *name, nodeAddr)
-			switch {
-			case err == nil:
-				fmt.Printf("announced to %-16s %s\n", host, addr)
-			case host == cfg.HostName:
-				// Our own daemon is down: fix the on-disk list directly.
-				nc.Hosts[*name] = nodeAddr
-				if err := config.SaveNet(nc); err != nil {
-					return err
-				}
-				fmt.Printf("announced to %-16s (daemon down — updated net.json directly)\n", host)
-			default:
-				fmt.Printf("announce to %-16s FAILED (%v) — run there: hive hosts add %s %s\n",
-					host, err, *name, nodeAddr)
-			}
-		}
-	} else if !*noAnnounce {
-		fmt.Printf("no control token here — on each host run: hive hosts add %s %s\n", *name, nodeAddr)
+	if err := announceAll(cfg, netName, nc, *name, nodeAddr, *noAnnounce); err != nil {
+		return err
 	}
 
 	fmt.Printf("\nnode %q is in the mesh:\n", *name)
@@ -433,6 +413,90 @@ func (s sshRunner) run(stdin *os.File, cmd string) (string, error) {
 	return out.String(), nil
 }
 
+// scp copies a local file to a remote path over the sftp channel (works
+// on Windows OpenSSH too, where there is no POSIX shell to pipe into).
+func (s sshRunner) scp(local, remote string) error {
+	remote = strings.ReplaceAll(remote, `\`, `/`)
+	c := exec.Command("scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-q",
+		local, s.target+":"+remote)
+	var errb strings.Builder
+	c.Stderr = &errb
+	if err := c.Run(); err != nil {
+		return fmt.Errorf("scp to %s:%s: %v: %s", s.target, remote, err, strings.TrimSpace(errb.String()))
+	}
+	return nil
+}
+
+// resolveHubAddr is this hub's address as reachable from the node:
+// the flag if given, else the local tailscale IPv4 + configured port.
+func resolveHubAddr(cfg config.Config, flag string) (string, error) {
+	if flag != "" {
+		if _, _, err := net.SplitHostPort(flag); err != nil {
+			return "", fmt.Errorf("bad --hub %q: %v", flag, err)
+		}
+		return flag, nil
+	}
+	ip := tailnetIPLocal()
+	if ip == "" {
+		return "", fmt.Errorf("cannot detect this host's tailscale IPv4 — pass --hub ADDR:PORT")
+	}
+	return net.JoinHostPort(ip, strconv.Itoa(cfg.Port)), nil
+}
+
+func warnLoopbackHub(cfg config.Config, hub string) {
+	if cfg.Bind == "127.0.0.1" || cfg.Bind == "::1" {
+		host, _, _ := net.SplitHostPort(hub)
+		fmt.Printf("WARNING: this host's daemon binds %s — the node cannot reach it.\n", cfg.Bind)
+		fmt.Printf("         restart it with: hive daemon --bind %s\n", host)
+	}
+}
+
+// waitHealthy polls the node's health endpoint from the operator side.
+func waitHealthy(nodeURL, hint string) error {
+	deadline := time.Now().Add(8 * time.Second)
+	for !healthOK(nodeURL) {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("node daemon never became healthy at %s — check: %s", nodeURL, hint)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	fmt.Printf("daemon healthy at %s\n", nodeURL)
+	return nil
+}
+
+// announceAll adds the new host to every hub in the local hosts list
+// (including our own; if our daemon is down the on-disk list is fixed
+// directly). Failures print the manual command, never abort.
+func announceAll(cfg config.Config, netName string, nc config.NetConfig, nodeName, nodeAddr string, skip bool) error {
+	if skip {
+		return nil
+	}
+	if nc.ControlToken == "" {
+		fmt.Printf("no control token here — on each host run: hive hosts add %s %s\n", nodeName, nodeAddr)
+		return nil
+	}
+	for host, addr := range nc.Hosts {
+		if host == nodeName {
+			continue
+		}
+		err := postHostsAdd(addr, netName, nc.ControlToken, nodeName, nodeAddr)
+		switch {
+		case err == nil:
+			fmt.Printf("announced to %-16s %s\n", host, addr)
+		case host == cfg.HostName:
+			nc.Hosts[nodeName] = nodeAddr
+			if err := config.SaveNet(nc); err != nil {
+				return err
+			}
+			fmt.Printf("announced to %-16s (daemon down — updated net.json directly)\n", host)
+		default:
+			fmt.Printf("announce to %-16s FAILED (%v) — run there: hive hosts add %s %s\n",
+				host, err, nodeName, nodeAddr)
+		}
+	}
+	return nil
+}
+
 // writeRemote streams content into a remote file under dir, 0600, via
 // the ssh channel (never argv).
 func writeRemote(ssh sshRunner, dir, path string, content []byte) error {
@@ -494,6 +558,9 @@ func crossCompile(goos, goarch, src string) (string, error) {
 		return "", fmt.Errorf("node is %s/%s but %q is not the hive source tree — pass --src or --bin", goos, goarch, src)
 	}
 	out := fmt.Sprintf("%s/hive-%s-%s", os.TempDir(), goos, goarch)
+	if goos == "windows" {
+		out += ".exe"
+	}
 	c := exec.Command("go", "build", "-o", out, "./cmd/hive")
 	c.Dir = src
 	c.Env = append(os.Environ(), "GOOS="+goos, "GOARCH="+goarch, "CGO_ENABLED=0")
@@ -533,12 +600,17 @@ func tailnetIPLocal() string {
 		if !ok {
 			continue
 		}
-		ip4 := ipn.IP.To4()
-		if ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
-			return ip4.String()
+		if isCGNAT(ipn.IP) {
+			return ipn.IP.To4().String()
 		}
 	}
 	return ""
+}
+
+// isCGNAT reports whether ip is in 100.64.0.0/10 (tailscale's range).
+func isCGNAT(ip net.IP) bool {
+	ip4 := ip.To4()
+	return ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127
 }
 
 func healthOK(base string) bool {

@@ -71,7 +71,11 @@ func runDaemon(args []string) error {
 	fs := flags("daemon", args)
 	bind := fs.String("bind", "", "override bind address (default from config, 127.0.0.1)")
 	port := fs.Int("port", 0, "override port (default from config, 7777)")
+	home := fs.String("home", "", "state directory (default $HIVE_HOME or ~/.hive)")
 	fs.Parse2()
+	if *home != "" {
+		os.Setenv("HIVE_HOME", *home)
+	}
 
 	if err := tmux.Available(); err != nil {
 		fmt.Fprintln(os.Stderr, "hive: warning: "+err.Error()+" — control ops will fail")
@@ -100,7 +104,7 @@ func usage() {
 	fmt.Print(`hive — agent communication + control mesh
 
 DAEMON
-  hive daemon [--bind ADDR] [--port N]     run this host's hub
+  hive daemon [--bind ADDR] [--port N] [--home DIR]   run this host's hub
 
 NETWORKS
   hive net create <name>                   create a network (prints tokens)

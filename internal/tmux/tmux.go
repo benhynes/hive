@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -151,10 +152,18 @@ func KillSession(session string) error {
 }
 
 // ProcStartEpoch returns a stable string identifying when pid started
-// (`ps -o lstart=`, same format on macOS and Linux). Comparing it against
-// the value captured at registration defeats pid reuse.
+// (`ps -o lstart=` on macOS/Linux, process StartTime ticks on Windows).
+// Comparing it against the value captured at registration defeats pid
+// reuse.
 func ProcStartEpoch(pid int) (string, error) {
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
+	var out []byte
+	var err error
+	if runtime.GOOS == "windows" {
+		out, err = exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
+			fmt.Sprintf("(Get-Process -Id %d).StartTime.Ticks", pid)).Output()
+	} else {
+		out, err = exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
+	}
 	if err != nil {
 		return "", fmt.Errorf("pid %d gone", pid)
 	}

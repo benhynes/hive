@@ -46,6 +46,42 @@ func TestSeedHosts(t *testing.T) {
 	}
 }
 
+func TestParseWinProbe(t *testing.T) {
+	c, arch, profile, err := parseWinProbe("Windows_NT DESKTOP-TFS0UOF AMD64 C:\\Users\\digiwin\r\n")
+	if err != nil || c != "DESKTOP-TFS0UOF" || arch != "amd64" || profile != `C:\Users\digiwin` {
+		t.Fatalf("got %q %q %q %v", c, arch, profile, err)
+	}
+	// Profiles may contain spaces; they're last so they survive the split.
+	_, _, profile, err = parseWinProbe(`Windows_NT PC ARM64 C:\Users\John Smith`)
+	if err != nil || profile != `C:\Users\John Smith` {
+		t.Fatalf("spaced profile: %q %v", profile, err)
+	}
+	if _, _, _, err := parseWinProbe("Windows_NT PC x86 C:\\Users\\a"); err == nil {
+		t.Fatal("32-bit x86 accepted")
+	}
+	if _, _, _, err := parseWinProbe("%OS% %COMPUTERNAME% %PROCESSOR_ARCHITECTURE% %USERPROFILE%"); err == nil {
+		t.Fatal("unexpanded cmd variables accepted")
+	}
+}
+
+func TestWinPath(t *testing.T) {
+	if p, err := winPath(`C:\Users\digiwin\.hive\`, "x"); err != nil || p != `C:\Users\digiwin\.hive` {
+		t.Fatalf("got %q %v", p, err)
+	}
+	for _, bad := range []string{`C:\Users\John Smith\.hive`, `C:\a'b`, `\\server\share`, `relative\path`, `C:\a"b`} {
+		if _, err := winPath(bad, "x"); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+}
+
+func TestWinPS(t *testing.T) {
+	// "hi" in UTF-16LE is 68 00 69 00 → aABpAA== in base64.
+	if got := winPS("hi"); got != "powershell -NoProfile -NonInteractive -EncodedCommand aABpAA==" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestRemotePath(t *testing.T) {
 	if p, err := remotePath("~/.local/bin/hive"); err != nil || p != "$HOME/.local/bin/hive" {
 		t.Errorf("tilde expansion: %q %v", p, err)

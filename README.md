@@ -68,11 +68,19 @@ appear in remote argv), starts the daemon, health-checks it from here,
 and announces the new host to every hub this one already knows.
 Defaults assume a tailnet: the node binds its tailscale IPv4 and dials
 back to ours; override with `--bind` / `--hub`. Useful flags:
-`--persist` (install a supervisor so the daemon survives crashes and
-reboots — a systemd unit on Linux, system-wide when root/sudo allows,
-else a user unit with best-effort lingering; a launchd agent on macOS),
+`--persist` (install a supervisor so the daemon survives reboots — a
+systemd unit on Linux, system-wide when root/sudo allows, else a user
+unit with best-effort lingering; a launchd agent on macOS; a boot
+scheduled task on Windows, admin required and boot-start only),
 `--msg-only` (never ship the control token), `--restart` (upgrade a
 running node), `--no-start`, `--name`, `--port`, `--dest`, `--home`.
+
+**Windows targets** work too (OpenSSH server required): the installer
+detects the platform through cmd/PowerShell, ships `hive.exe` over
+scp, opens the daemon port in Windows Defender Firewall when the ssh
+user is admin, and pins state with `daemon --home`. Windows hosts are
+**message-only** — the daemon, inboxes, and discovery all work, but
+control ops need tmux.
 
 Or manually:
 
