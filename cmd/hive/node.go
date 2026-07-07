@@ -68,7 +68,8 @@ func nodeInstall(args []string) error {
 		*msgOnly = true
 	}
 
-	ssh := sshRunner{target: target}
+	ssh, sshCleanup := newSSHRunner(target)
+	defer sshCleanup()
 
 	// 1. What are we installing onto?
 	fmt.Printf("probing %s ...\n", target)
@@ -274,12 +275,18 @@ RestartSec=2
 WantedBy=default.target
 `
 
+// launchdPlist args (in order): binary path, HIVE_HOME, PATH, log dir, log
+// dir. A GUI LaunchAgent otherwise inherits only /usr/bin:/bin:/usr/sbin:
+// /sbin, which excludes Homebrew (where tmux lives) and ~/.local/bin (where
+// the claude CLI lives), so the daemon's spawn path can't find either until
+// the plist is hand-edited. LC_ALL=C pins the ps-lstart format the liveness
+// check compares (see internal/tmux ProcStartEpoch).
 const launchdPlist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.hive.daemon</string>
   <key>ProgramArguments</key><array><string>%s</string><string>daemon</string></array>
-  <key>EnvironmentVariables</key><dict><key>HIVE_HOME</key><string>%s</string></dict>
+  <key>EnvironmentVariables</key><dict><key>HIVE_HOME</key><string>%s</string><key>PATH</key><string>%s</string><key>LC_ALL</key><string>C</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>%s/daemon.log</string>
@@ -301,9 +308,36 @@ func persistNode(ssh sshRunner, goos, dest, home string, startNow bool) (string,
 	}
 	abs := func(p string) string { return strings.ReplaceAll(p, "$HOME", absHome) }
 	if goos == "darwin" {
-		return persistLaunchd(ssh, abs(dest), abs(home))
+		return persistLaunchd(ssh, abs(dest), abs(home), absHome)
 	}
 	return persistSystemd(ssh, abs(dest), abs(home), startNow)
+}
+
+// launchdPATH is the PATH a persisted macOS daemon needs to find tmux
+// (Homebrew) and claude (~/.local/bin). It seeds the standard locations
+// from the node's home, then unions in the node's login-shell PATH (which
+// sources ~/.zprofile, so a nonstandard Homebrew/claude prefix is picked
+// up too) when the probe yields one.
+func launchdPATH(ssh sshRunner, home string) string {
+	base := "/opt/homebrew/bin:/opt/homebrew/sbin:" + home + "/.local/bin:" + home + "/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+	// Login-shell PATH probe; \$PATH is escaped so the outer sh -c leaves it
+	// for the login shell to expand. Best-effort — base alone already works.
+	out, err := ssh.run(nil, `sh -c 'S=${SHELL:-/bin/sh}; "$S" -lc "printf %s \"\$PATH\"" 2>/dev/null'`)
+	login := strings.TrimSpace(out)
+	path := base
+	if err == nil && strings.Contains(login, "/") {
+		path = login + ":" + base
+	}
+	// The value lands in a plist <string>; escape XML metacharacters so a
+	// dir name containing & < > can't corrupt the file.
+	return xmlEscape(path)
+}
+
+func xmlEscape(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
 }
 
 func persistSystemd(ssh sshRunner, dest, home string, startNow bool) (string, error) {
@@ -358,8 +392,8 @@ func persistSystemd(ssh sshRunner, dest, home string, startNow bool) (string, er
 	return fmt.Sprintf("systemd system unit (/etc/systemd/system/hive.service, User=%s, via %s)", user, mode), nil
 }
 
-func persistLaunchd(ssh sshRunner, dest, home string) (string, error) {
-	plist := fmt.Sprintf(launchdPlist, dest, home, home, home)
+func persistLaunchd(ssh sshRunner, dest, home, userHome string) (string, error) {
+	plist := fmt.Sprintf(launchdPlist, dest, home, launchdPATH(ssh, userHome), home, home)
 	if err := writeRemote(ssh, "$HOME/Library/LaunchAgents", "$HOME/Library/LaunchAgents/com.hive.daemon.plist", []byte(plist)); err != nil {
 		return "", err
 	}
@@ -397,11 +431,41 @@ func resolveNetConfig(netFlag string) (string, config.NetConfig, error) {
 
 // sshRunner shells out to ssh with batch-mode settings; the command is
 // one string parsed by the remote shell (we only ever wrap POSIX
-// sh -c '...' scripts that contain no single quotes).
-type sshRunner struct{ target string }
+// sh -c '...' scripts that contain no single quotes). When ctlPath is set,
+// every run/scp shares one multiplexed connection (ControlMaster), so an
+// install's 6-11 steps pay a single handshake instead of one each.
+type sshRunner struct {
+	target  string
+	ctlPath string
+}
+
+// newSSHRunner builds a runner backed by an SSH ControlMaster so all the
+// install's ssh/scp invocations reuse one connection. The cleanup closes
+// the master (ssh -O exit) and removes the socket dir; call it via defer.
+// If a temp dir can't be made it degrades to unmultiplexed ssh.
+func newSSHRunner(target string) (sshRunner, func()) {
+	dir, err := os.MkdirTemp("/tmp", "hive-cm")
+	if err != nil {
+		return sshRunner{target: target}, func() {}
+	}
+	ctl := dir + "/s" // short: the ControlPath socket must fit sun_path (~104)
+	cleanup := func() {
+		exec.Command("ssh", "-o", "ControlPath="+ctl, "-O", "exit", target).Run()
+		os.RemoveAll(dir)
+	}
+	return sshRunner{target: target, ctlPath: ctl}, cleanup
+}
+
+func (s sshRunner) opts() []string {
+	o := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=10"}
+	if s.ctlPath != "" {
+		o = append(o, "-o", "ControlMaster=auto", "-o", "ControlPath="+s.ctlPath, "-o", "ControlPersist=30s")
+	}
+	return o
+}
 
 func (s sshRunner) run(stdin *os.File, cmd string) (string, error) {
-	c := exec.Command("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", s.target, cmd)
+	c := exec.Command("ssh", append(s.opts(), s.target, cmd)...)
 	if stdin != nil {
 		c.Stdin = stdin
 	}
@@ -417,8 +481,7 @@ func (s sshRunner) run(stdin *os.File, cmd string) (string, error) {
 // on Windows OpenSSH too, where there is no POSIX shell to pipe into).
 func (s sshRunner) scp(local, remote string) error {
 	remote = strings.ReplaceAll(remote, `\`, `/`)
-	c := exec.Command("scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-q",
-		local, s.target+":"+remote)
+	c := exec.Command("scp", append(s.opts(), "-q", local, s.target+":"+remote)...)
 	var errb strings.Builder
 	c.Stderr = &errb
 	if err := c.Run(); err != nil {

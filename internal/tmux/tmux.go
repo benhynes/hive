@@ -7,6 +7,7 @@
 package tmux
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func args(rest ...string) []string {
@@ -59,9 +61,12 @@ func shellQuote(s string) string {
 }
 
 // NewSession starts a detached session running cmd with env injected via
-// tmux -e flags (values never pass through a shell). Returns the pane id.
-func NewSession(session, cwd string, env map[string]string, cmd []string) (string, error) {
-	a := []string{"new-session", "-d", "-s", session, "-x", "220", "-y", "50"}
+// tmux -e flags (values never pass through a shell). It returns the new
+// pane's id and pid in one round trip: -P -F prints both fields from the
+// create call, so callers need neither a follow-up list-panes (FirstPane)
+// nor a display-message (PanePID).
+func NewSession(session, cwd string, env map[string]string, cmd []string) (string, int, error) {
+	a := []string{"new-session", "-d", "-P", "-F", "#{pane_id} #{pane_pid}", "-s", session, "-x", "220", "-y", "50"}
 	if cwd != "" {
 		a = append(a, "-c", cwd)
 	}
@@ -78,10 +83,19 @@ func NewSession(session, cwd string, env map[string]string, cmd []string) (strin
 		quoted[i] = shellQuote(c)
 	}
 	a = append(a, strings.Join(quoted, " "))
-	if _, err := run(a...); err != nil {
-		return "", err
+	out, err := run(a...)
+	if err != nil {
+		return "", 0, err
 	}
-	return FirstPane(session)
+	f := strings.Fields(out)
+	if len(f) < 2 {
+		return "", 0, fmt.Errorf("new-session gave unexpected output %q", strings.TrimSpace(out))
+	}
+	pid, err := strconv.Atoi(f[1])
+	if err != nil {
+		return "", 0, fmt.Errorf("new-session pane pid %q: %v", f[1], err)
+	}
+	return f[0], pid, nil
 }
 
 // FirstPane returns the pane id (%N) of a session's first pane.
@@ -169,7 +183,18 @@ func OpenWindow(session string) error {
 		// permissions and reliably creates a visible window.
 		script := fmt.Sprintf("tell application \"Terminal\"\nactivate\ndo script %q\nend tell",
 			strings.Join(argv, " "))
-		if out, err := exec.Command("osascript", "-e", script).CombinedOutput(); err != nil {
+		// Bound the exec: `activate`/`do script` blocks until Terminal
+		// finishes AND until any pending Automation (TCC) authorization
+		// prompt is dismissed — a first-time grant can leave osascript
+		// hanging indefinitely, and this runs inline on the spawn's HTTP
+		// response. The timeout caps that at a cold-launch-generous 12s so
+		// a spawn can never wedge; the window is best-effort anyway.
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		defer cancel()
+		if out, err := exec.CommandContext(ctx, "osascript", "-e", script).CombinedOutput(); err != nil {
+			if ctx.Err() != nil {
+				return fmt.Errorf("osascript timed out after 12s (a pending Automation permission prompt for Terminal? grant it once, then re-run)")
+			}
 			return fmt.Errorf("osascript: %v: %s", err, strings.TrimSpace(string(out)))
 		}
 		return nil
@@ -211,7 +236,16 @@ func OpenWindow(session string) error {
 // (`ps -o lstart=`). Comparing it against the value captured at
 // registration defeats pid reuse.
 func ProcStartEpoch(pid int) (string, error) {
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
+	// Force the C locale: `ps -o lstart` is strftime-formatted and its
+	// month/day order flips with the caller's locale (en_CA "Mon  6 Jul"
+	// vs C "Mon Jul  6"). Since this string is stored at registration and
+	// compared verbatim on every liveness check, a daemon that writes it
+	// under one locale and reads it under another (exactly what a --persist
+	// launchd/systemd daemon vs an interactive one produces) would see
+	// every spawned agent as dead. Pinning LC_ALL makes it deterministic.
+	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=")
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
+	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("pid %d gone", pid)
 	}

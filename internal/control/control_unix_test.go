@@ -29,7 +29,7 @@ func setup(t *testing.T) {
 
 func TestLifecycleThroughSeam(t *testing.T) {
 	setup(t)
-	pane, err := NewSession("ctl-life", "", nil, []string{"sleep", "60"}, false)
+	pane, spawnPID, err := NewSession("ctl-life", "", nil, []string{"sleep", "60"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,6 +39,9 @@ func TestLifecycleThroughSeam(t *testing.T) {
 	pid, err := PanePID(pane)
 	if err != nil || pid <= 0 {
 		t.Fatalf("pid=%d err=%v", pid, err)
+	}
+	if spawnPID != pid {
+		t.Fatalf("NewSession pid %d != PanePID %d", spawnPID, pid)
 	}
 	epoch, err := ProcStartEpoch(pid)
 	if err != nil || epoch == "" {
@@ -61,10 +64,10 @@ func TestLifecycleThroughSeam(t *testing.T) {
 
 func TestDuplicateSessionTyped(t *testing.T) {
 	setup(t)
-	if _, err := NewSession("ctl-dup", "", nil, []string{"sleep", "60"}, false); err != nil {
+	if _, _, err := NewSession("ctl-dup", "", nil, []string{"sleep", "60"}, false); err != nil {
 		t.Fatal(err)
 	}
-	_, err := NewSession("ctl-dup", "", nil, []string{"sleep", "60"}, false)
+	_, _, err := NewSession("ctl-dup", "", nil, []string{"sleep", "60"}, false)
 	if !errors.Is(err, ErrDuplicateSession) {
 		t.Fatalf("want ErrDuplicateSession, got %v", err)
 	}
@@ -75,7 +78,7 @@ func TestDuplicateSessionTyped(t *testing.T) {
 // control forks until the deadline.
 func TestWaitQuiescentDeadPane(t *testing.T) {
 	setup(t)
-	pane, err := NewSession("ctl-wq-dead", "", nil, []string{"cat"}, false)
+	pane, _, err := NewSession("ctl-wq-dead", "", nil, []string{"cat"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}

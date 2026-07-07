@@ -19,15 +19,15 @@ func Available() error { return tmux.Available() }
 func AllowClientPane(pane string) error { return nil }
 
 // NewSession starts a detached session running cmd with env injected and
-// returns its pane id. headed is a spawn-time hint only Windows needs
-// (tmux sessions are always headless; OpenWindow attaches a terminal
+// returns its pane id and pid. headed is a spawn-time hint only Windows
+// needs (tmux sessions are always headless; OpenWindow attaches a terminal
 // afterwards).
-func NewSession(session, cwd string, env map[string]string, cmd []string, headed bool) (string, error) {
-	pane, err := tmux.NewSession(session, cwd, env, cmd)
+func NewSession(session, cwd string, env map[string]string, cmd []string, headed bool) (string, int, error) {
+	pane, pid, err := tmux.NewSession(session, cwd, env, cmd)
 	if err != nil && strings.Contains(err.Error(), "duplicate session") {
-		return "", fmt.Errorf("%w: %v", ErrDuplicateSession, err)
+		return "", 0, fmt.Errorf("%w: %v", ErrDuplicateSession, err)
 	}
-	return pane, err
+	return pane, pid, err
 }
 
 // PaneExists reports whether the pane is still alive.

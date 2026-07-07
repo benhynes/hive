@@ -62,7 +62,7 @@ func TestSendKeysLiteralQuoting(t *testing.T) {
 	for i, tc := range nasty {
 		out := filepath.Join(dir, fmt.Sprintf("out%d", i))
 		sess := fmt.Sprintf("q%d", i)
-		if _, err := NewSession(sess, "", nil, []string{"sh", "-c", "cat > " + out}); err != nil {
+		if _, _, err := NewSession(sess, "", nil, []string{"sh", "-c", "cat > " + out}); err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
 		pane, err := FirstPane(sess)
@@ -87,7 +87,7 @@ func TestSendKeysLiteralQuoting(t *testing.T) {
 func TestPasteMultiline(t *testing.T) {
 	setup(t)
 	out := filepath.Join(t.TempDir(), "out")
-	if _, err := NewSession("paste", "", nil, []string{"sh", "-c", "cat > " + out}); err != nil {
+	if _, _, err := NewSession("paste", "", nil, []string{"sh", "-c", "cat > " + out}); err != nil {
 		t.Fatal(err)
 	}
 	pane, _ := FirstPane("paste")
@@ -109,7 +109,7 @@ func TestEnvInjection(t *testing.T) {
 		"HIVE_NET":   "dev",
 	}
 	cmd := []string{"sh", "-c", `printf '%s|%s' "$HIVE_TOKEN" "$HIVE_NET" > ` + out + `; sleep 60`}
-	if _, err := NewSession("envt", "", env, cmd); err != nil {
+	if _, _, err := NewSession("envt", "", env, cmd); err != nil {
 		t.Fatal(err)
 	}
 	waitFile(t, out, env["HIVE_TOKEN"]+"|dev")
@@ -117,7 +117,7 @@ func TestEnvInjection(t *testing.T) {
 
 func TestPaneLifecycle(t *testing.T) {
 	setup(t)
-	pane, err := NewSession("life", "", nil, []string{"sleep", "60"})
+	pane, spawnPID, err := NewSession("life", "", nil, []string{"sleep", "60"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,6 +127,11 @@ func TestPaneLifecycle(t *testing.T) {
 	pid, err := PanePID(pane)
 	if err != nil || pid <= 0 {
 		t.Fatalf("pid=%d err=%v", pid, err)
+	}
+	// The pid NewSession reported from its -P -F create call must match
+	// what a follow-up display-message resolves.
+	if spawnPID != pid {
+		t.Fatalf("NewSession pid %d != PanePID %d", spawnPID, pid)
 	}
 	epoch, err := ProcStartEpoch(pid)
 	if err != nil || epoch == "" {

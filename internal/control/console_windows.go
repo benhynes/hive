@@ -26,11 +26,13 @@
 package control
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -184,19 +186,20 @@ func openVerified(pid uint32, creation uint64, hasEpoch bool, access uint32) (sy
 }
 
 // NewSession starts cmd in its own console with env injected and returns
-// the pane id. headed selects a visible console window (only meaningful
-// when the daemon runs in the interactive user session); headless spawns
-// use CREATE_NO_WINDOW — same conhost, no window, still controllable.
-func NewSession(session, cwd string, env map[string]string, cmd []string, headed bool) (string, error) {
+// the pane id and pid. headed selects a visible console window (only
+// meaningful when the daemon runs in the interactive user session);
+// headless spawns use CREATE_NO_WINDOW — same conhost, no window, still
+// controllable.
+func NewSession(session, cwd string, env map[string]string, cmd []string, headed bool) (string, int, error) {
 	if len(cmd) == 0 {
-		return "", fmt.Errorf("empty command")
+		return "", 0, fmt.Errorf("empty command")
 	}
 	path, err := exec.LookPath(cmd[0])
 	if err != nil && !errors.Is(err, exec.ErrDot) {
-		return "", fmt.Errorf("%s: %w", cmd[0], err)
+		return "", 0, fmt.Errorf("%s: %w", cmd[0], err)
 	}
 	if path, err = filepath.Abs(path); err != nil {
-		return "", err
+		return "", 0, err
 	}
 	argv := append([]string{path}, cmd[1:]...)
 	// CreateProcess cannot exec batch files directly; hand them to
@@ -216,24 +219,24 @@ func NewSession(session, cwd string, env map[string]string, cmd []string, headed
 	}
 	cmdline, err := syscall.UTF16PtrFromString(strings.Join(quoted, " "))
 	if err != nil {
-		return "", fmt.Errorf("command contains NUL")
+		return "", 0, fmt.Errorf("command contains NUL")
 	}
 	// lpApplicationName is set explicitly (not derived from the command
 	// line) so CreateProcess never runs its ambiguous first-token search,
 	// which would otherwise probe the current directory.
 	pathp, err := syscall.UTF16PtrFromString(path)
 	if err != nil {
-		return "", fmt.Errorf("command contains NUL")
+		return "", 0, fmt.Errorf("command contains NUL")
 	}
 	var dirp *uint16
 	if cwd != "" {
 		if dirp, err = syscall.UTF16PtrFromString(cwd); err != nil {
-			return "", fmt.Errorf("cwd contains NUL")
+			return "", 0, fmt.Errorf("cwd contains NUL")
 		}
 	}
 	block, err := envBlock(env)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	si := &syscall.StartupInfo{
@@ -250,7 +253,7 @@ func NewSession(session, cwd string, env map[string]string, cmd []string, headed
 		flags |= createNoWindow
 	}
 	if err := syscall.CreateProcess(pathp, cmdline, nil, nil, false, flags, &block[0], dirp, si, pi); err != nil {
-		return "", fmt.Errorf("CreateProcess %s: %v", cmd[0], err)
+		return "", 0, fmt.Errorf("CreateProcess %s: %v", cmd[0], err)
 	}
 	syscall.CloseHandle(pi.Thread)
 	// Read the creation stamp from the process handle we already hold,
@@ -258,9 +261,9 @@ func NewSession(session, cwd string, env map[string]string, cmd []string, headed
 	creation, cerr := creationTime(pi.Process)
 	syscall.CloseHandle(pi.Process)
 	if cerr != nil {
-		return "", fmt.Errorf("spawned process died immediately")
+		return "", 0, fmt.Errorf("spawned process died immediately")
 	}
-	return winPane(pi.ProcessId, creation), nil
+	return winPane(pi.ProcessId, creation), int(pi.ProcessId), nil
 }
 
 // envBlock merges extra into the daemon's environment (Windows env names
@@ -360,6 +363,11 @@ func KillSession(_, pane string) error {
 	if err != nil {
 		return err
 	}
+	// Tear the helper down BEFORE contending for lockPane: if a conOp is
+	// wedged in a helper exchange holding lockPane, killing the helper makes
+	// its request() read fail so that conOp releases the lock — otherwise
+	// KillSession could never acquire it and the pane would be un-killable.
+	killHelper(pane)
 	unlock := lockPane(pane)
 	defer unlock()
 	// Holding this handle pins the pid: taskkill /PID re-resolves by pid,
@@ -426,16 +434,221 @@ func Capture(pane string, lines int) (string, error) {
 // OpenWindow makes the session's console window visible — only possible
 // for sessions spawned with headed=true (CREATE_NO_WINDOW consoles have
 // no window at all, revealable or otherwise).
+//
+// Right after CreateProcess the child's conhost has not necessarily
+// created its console window yet, so the first show races and fails
+// ("handle is invalid", or a NULL hwnd). A delayed show is observed to
+// succeed within a couple of seconds, so retry with backoff — treating
+// ANY error as retryable, since the race surfaces as both shapes.
 func OpenWindow(_, pane string) error {
-	_, err := conOp(pane, "show")
-	return err
+	backoff := 50 * time.Millisecond
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		_, err := conOp(pane, "show")
+		if err == nil {
+			return nil
+		}
+		// Permanent conditions (a headless spawn, or a non-interactive
+		// Session-0 daemon) will never succeed — return at once instead of
+		// spinning the whole retry budget. Only the conhost-not-ready race
+		// after CreateProcess is transient and worth retrying.
+		if s := err.Error(); strings.Contains(s, "no console window") ||
+			strings.Contains(s, "interactive desktop session") {
+			return err
+		}
+		if !time.Now().Add(backoff).Before(deadline) {
+			return err
+		}
+		time.Sleep(backoff)
+		if backoff < 800*time.Millisecond {
+			backoff *= 2
+		}
+	}
 }
 
-// conOp runs one attach-requiring console operation in a detached helper
-// process (this binary re-exec'd as `hive __conop`). The pid and
-// creation stamp travel as argv so the helper can re-verify identity
-// before it attaches. See conop_windows.go.
+// conHelper is a persistent `hive __conop serve` process bound to one
+// pane's console: it AttachConsole's once, then services framed ops over
+// its stdio pipes, so repeated keys/read/show skip the per-op CreateProcess
+// + Go-runtime init + AttachConsole that the one-shot path pays. Access is
+// serialized by the caller's lockPane(pane), so no internal mutex is
+// needed; helpersMu only guards the map against other panes' teardowns.
+type conHelper struct {
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stdout *bufio.Reader
+}
+
+var (
+	helpersMu sync.Mutex
+	helpers   = map[string]*conHelper{}
+)
+
+// conOp runs one attach-requiring console operation. It prefers the pane's
+// persistent helper and falls back to a one-shot re-exec on a transport
+// failure (no helper yet, or a dead one) — which also covers cold start.
+//
+// The fallback is gated for safety: a keys op that reached the helper but
+// whose reply was lost may already have typed into the console, so re-running
+// it would duplicate keystrokes. Only fall back when the op provably never
+// reached the helper (write-side failure) or is read-only/idempotent
+// (capture, show); otherwise surface the transport error.
 func conOp(pane, op string, args ...string) (string, error) {
+	if _, _, _, err := parsePane(pane); err != nil {
+		return "", err
+	}
+	arg := ""
+	if len(args) > 0 {
+		arg = args[0]
+	}
+	unlock := lockPane(pane)
+	defer unlock()
+
+	if h, err := getHelperLocked(pane); err == nil {
+		data, opErr, transportErr, wrote := h.request(op, arg)
+		if transportErr == nil {
+			return data, opErr
+		}
+		dropHelperLocked(pane, h)
+		if wrote && op != "capture" && op != "show" {
+			return "", fmt.Errorf("console %s: %v", op, transportErr)
+		}
+		// fall through to a one-shot for this op
+	}
+	return conOpOneShot(pane, op, arg)
+}
+
+// getHelperLocked returns the pane's helper, spawning one if absent. The
+// caller must hold lockPane(pane), which serializes spawns for a pane.
+func getHelperLocked(pane string) (*conHelper, error) {
+	helpersMu.Lock()
+	h := helpers[pane]
+	helpersMu.Unlock()
+	if h != nil {
+		return h, nil
+	}
+	h, err := startHelper(pane)
+	if err != nil {
+		return nil, err
+	}
+	helpersMu.Lock()
+	helpers[pane] = h
+	helpersMu.Unlock()
+	return h, nil
+}
+
+func startHelper(pane string) (*conHelper, error) {
+	pid, creation, _, err := parsePane(pane)
+	if err != nil {
+		return nil, err
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.Command(exe, "__conop", "serve", strconv.Itoa(int(pid)), strconv.FormatUint(creation, 10))
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: detachedProcess}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	// The serve loop attaches BEFORE reading any request, so a request sent
+	// now simply waits in the pipe until attach completes; if attach fails
+	// the process exits and the first request's read hits EOF (a transport
+	// error the caller turns into a one-shot fallback).
+	return &conHelper{cmd: cmd, stdin: stdin, stdout: bufio.NewReader(stdout)}, nil
+}
+
+// request sends one framed op and reads the framed reply, bounded by
+// conOpTimeout so a wedged console (a helper stuck in a kernel console call
+// that never replies) can't block the pane forever — the one-shot path had
+// this bound and the fast path must not lose it. transportErr signals a
+// broken/dead/wedged helper (pipe failure, timeout, malformed frame); opErr
+// is a well-formed ERR reply from a healthy helper. wrote reports whether
+// the request reached the helper's stdin, so the caller knows a mutating op
+// may already have run (making a re-run unsafe).
+//
+// The write is synchronous: the request is tiny (< the pipe buffer), so it
+// cannot block even if the helper is not draining stdin. Only the reply
+// read can block, so only it is watchdogged.
+func (h *conHelper) request(op, arg string) (data string, opErr, transportErr error, wrote bool) {
+	if _, err := io.WriteString(h.stdin, op+"\t"+arg+"\n"); err != nil {
+		return "", nil, err, false
+	}
+	type reply struct {
+		line string
+		err  error
+	}
+	ch := make(chan reply, 1)
+	go func() {
+		line, err := h.stdout.ReadString('\n')
+		ch <- reply{line, err}
+	}()
+	select {
+	case <-time.After(conOpTimeout):
+		return "", nil, fmt.Errorf("helper timed out (console unresponsive)"), true
+	case r := <-ch:
+		if r.err != nil {
+			return "", nil, r.err, true
+		}
+		status, b64, _ := strings.Cut(strings.TrimRight(r.line, "\r\n"), " ")
+		raw, derr := base64.StdEncoding.DecodeString(b64)
+		if derr != nil {
+			return "", nil, fmt.Errorf("bad helper payload: %v", derr), true
+		}
+		switch status {
+		case "OK":
+			return string(raw), nil, nil, true
+		case "ERR":
+			return "", fmt.Errorf("console %s: %s", op, string(raw)), nil, true
+		default:
+			return "", nil, fmt.Errorf("bad helper status %q", status), true
+		}
+	}
+}
+
+// close terminates the helper. Killing the process (not just closing stdin)
+// is required to unblock a helper wedged in a console call and to release
+// its pinned pid handle and any leaked reply-reader goroutine.
+func (h *conHelper) close() {
+	h.stdin.Close()
+	if h.cmd.Process != nil {
+		h.cmd.Process.Kill()
+	}
+	go h.cmd.Wait() // reap the detached process
+}
+
+// dropHelperLocked removes a dead helper (caller holds lockPane(pane)).
+func dropHelperLocked(pane string, h *conHelper) {
+	helpersMu.Lock()
+	if helpers[pane] == h {
+		delete(helpers, pane)
+	}
+	helpersMu.Unlock()
+	h.close()
+}
+
+// killHelper tears down a pane's helper on session kill.
+func killHelper(pane string) {
+	helpersMu.Lock()
+	h := helpers[pane]
+	delete(helpers, pane)
+	helpersMu.Unlock()
+	if h != nil {
+		h.close()
+	}
+}
+
+// conOpOneShot runs one op in a fresh detached `hive __conop` process (the
+// cold-start / degraded-fallback path; the pid and creation stamp travel
+// as argv so the helper re-verifies identity before it attaches).
+func conOpOneShot(pane, op, arg string) (string, error) {
 	pid, creation, _, err := parsePane(pane)
 	if err != nil {
 		return "", err
@@ -444,11 +657,12 @@ func conOp(pane, op string, args ...string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	unlock := lockPane(pane)
-	defer unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), conOpTimeout)
 	defer cancel()
-	argv := append([]string{"__conop", op, strconv.Itoa(int(pid)), strconv.FormatUint(creation, 10)}, args...)
+	argv := []string{"__conop", op, strconv.Itoa(int(pid)), strconv.FormatUint(creation, 10)}
+	if arg != "" {
+		argv = append(argv, arg)
+	}
 	cmd := exec.CommandContext(ctx, exe, argv...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: detachedProcess}
 	var stdout, stderr bytes.Buffer
