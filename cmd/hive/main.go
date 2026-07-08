@@ -54,6 +54,8 @@ func main() {
 		err = runRead(args)
 	case "kill":
 		err = runKill(args)
+	case "dash":
+		err = runDash(args)
 	case "__conop":
 		// Hidden Windows console-op helper the daemon re-execs itself
 		// as; see internal/control/conop_windows.go.
@@ -139,6 +141,10 @@ CONTROL (control layer; goes direct to the target host)
   hive keys [--enter] <agent> <text...>
   hive read [--lines N] <agent>
   hive kill <agent>
+  hive dash [--web] [--bind A] [--port N] [--open=false]
+                                           web dashboard: live grid of every
+                                           agent's screen + status, zoom to
+                                           type into one (default :7780)
 
 Config: HIVE_ADDR HIVE_NET HIVE_TOKEN HIVE_CONTROL_TOKEN HIVE_AGENT
         (per-host: ~/.hive/config.json; per-net: ~/.hive/nets/<net>/)

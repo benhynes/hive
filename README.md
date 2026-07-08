@@ -145,7 +145,23 @@ hive spawn [--host H] [--cwd D] [--grant-control] [--wait] [--headed] <name> -- 
 hive keys [--enter] <agent> <text...>
 hive read [--lines N] <agent>
 hive kill <agent>
+hive dash [--web] [--bind A] [--port N] [--open=false]
 ```
+
+## Dashboard
+
+`hive dash` serves a local web dashboard (default `127.0.0.1:7780`) that
+watches every agent on the net at once: it polls the registry so tiles
+appear and disappear as agents spawn and die, captures each screen via
+the read endpoint (never attaches, so panes keep their native size), and
+derives a status per tile — **attention** (permission/trust/login
+prompts, sorted first), working, idle, active, quiet, dead, unreachable.
+Click a tile to zoom: live view plus a keyboard — typed text and special
+keys go through the keys endpoint, so you can answer a prompt or kill an
+agent without ssh or nested tmux. Needs the control token. The page is
+guarded by a per-run token and a Host-header check, and the server
+refuses non-loopback binds (the dashboard fronts control of every
+agent) — view it remotely over `ssh -L 7780:127.0.0.1:7780 <host>`.
 
 Flags come before positionals. Agent-facing docs: **docs/AGENT-GUIDE.md**.
 Wire format and semantics: **docs/PROTOCOL.md**.

@@ -17,6 +17,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/benhynes/hive/internal/config"
@@ -31,9 +32,15 @@ type Client struct {
 	Agent   string // our own id (name@host) if known
 	hc      *http.Client
 
+	mu    sync.RWMutex      // guards self + hosts (dash reads concurrently)
 	self  string            // local hub's host name (lazy)
 	hosts map[string]string // local hub's hosts list (lazy)
 }
+
+// SetHTTPTimeout overrides the request timeout. Long-running pollers
+// (dash) use a short one so a black-holed host can't stall a poll loop.
+// Not safe to call concurrently with in-flight requests.
+func (c *Client) SetHTTPTimeout(d time.Duration) { c.hc.Timeout = d }
 
 // Resolve builds a client from env, flags, and local config.
 func Resolve(netFlag string) (*Client, error) {
@@ -152,7 +159,9 @@ func (c *Client) Hosts() (HostsResp, error) {
 	var out HostsResp
 	err := c.do("GET", c.Addr, c.np("/hosts"), c.Token, nil, &out)
 	if err == nil {
+		c.mu.Lock()
 		c.self, c.hosts = out.Self, out.Hosts
+		c.mu.Unlock()
 	}
 	return out, err
 }
@@ -170,12 +179,17 @@ func (c *Client) HostsMod(op, name, addr string) (HostsResp, error) {
 
 // Self returns the local hub's host name.
 func (c *Client) Self() (string, error) {
-	if c.self == "" {
-		if _, err := c.Hosts(); err != nil {
+	c.mu.RLock()
+	self := c.self
+	c.mu.RUnlock()
+	if self == "" {
+		res, err := c.Hosts()
+		if err != nil {
 			return "", err
 		}
+		self = res.Self
 	}
-	return c.self, nil
+	return self, nil
 }
 
 // ExpandAgent turns "name" into "name@<localhost>"; full ids pass through.
@@ -199,12 +213,17 @@ func (c *Client) hubFor(host string) (string, error) {
 	if host == self {
 		return c.Addr, nil
 	}
-	if c.hosts == nil {
-		if _, err := c.Hosts(); err != nil {
+	c.mu.RLock()
+	hosts := c.hosts
+	c.mu.RUnlock()
+	if hosts == nil {
+		res, err := c.Hosts()
+		if err != nil {
 			return "", err
 		}
+		hosts = res.Hosts
 	}
-	addr, ok := c.hosts[host]
+	addr, ok := hosts[host]
 	if !ok {
 		return "", fmt.Errorf("unknown host %q — add it with: hive hosts add %s <addr:port>", host, host)
 	}
