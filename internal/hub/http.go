@@ -605,15 +605,27 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 
 	rec, serr := h.spawnCore(n, h.actor(r, id), req, session, tok, env)
 	if serr != nil {
+		// A persist-spawn of an agent that is already alive is a declaration
+		// update, not a conflict — that makes `spawn --persist` idempotent
+		// ("ensure declared and running"), e.g. on re-provisioning.
+		if serr.code == 409 && req.Persist {
+			if old, ok := n.reg.Get(req.Name); ok && alive(old) && old.Session == session {
+				if err := h.declare(n, req); err != nil {
+					httpErr(w, 500, "persist: %v", err)
+					return
+				}
+				n.auditLine(h.actor(r, id), "spawn", req.Name+"@"+h.Cfg.HostName, "already live; declaration updated")
+				writeJSON(w, 200, spawnResp{
+					Agent: old.Name + "@" + h.Cfg.HostName, Session: old.Session, Pane: old.Pane, Ready: true,
+				})
+				return
+			}
+		}
 		httpErr(w, serr.code, "%s", serr.msg)
 		return
 	}
 	if req.Persist {
-		spec := store.PersistSpec{
-			Name: req.Name, Cmd: req.Cmd, Cwd: req.Cwd,
-			GrantControl: req.GrantControl, Declared: time.Now().UnixMilli(),
-		}
-		if err := n.persist.Put(spec); err != nil {
+		if err := h.declare(n, req); err != nil {
 			// The spawn itself succeeded; a failed declaration must not
 			// silently pass for one.
 			httpErr(w, 500, "spawned, but could not persist the declaration: %v", err)
@@ -641,6 +653,14 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 	writeJSON(w, 200, spawnResp{
 		Agent: rec.Name + "@" + h.Cfg.HostName, Session: rec.Session, Pane: rec.Pane,
 		Ready: ready, Window: window,
+	})
+}
+
+// declare records a spawn request as a desired session in the persist store.
+func (h *Hub) declare(n *network, req spawnReq) error {
+	return n.persist.Put(store.PersistSpec{
+		Name: req.Name, Cmd: req.Cmd, Cwd: req.Cwd,
+		GrantControl: req.GrantControl, Declared: time.Now().UnixMilli(),
 	})
 }
 
