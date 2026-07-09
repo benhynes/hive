@@ -448,7 +448,7 @@ type SpawnResp struct {
 	Window  string `json:"window,omitempty"`
 }
 
-func (c *Client) Spawn(host, name string, cmd []string, cwd string, grantControl, waitReady, headed bool) (SpawnResp, error) {
+func (c *Client) Spawn(host, name string, cmd []string, cwd string, grantControl, waitReady, headed, persist bool) (SpawnResp, error) {
 	tok, err := c.controlToken()
 	if err != nil {
 		return SpawnResp{}, err
@@ -466,6 +466,7 @@ func (c *Client) Spawn(host, name string, cmd []string, cwd string, grantControl
 	err = c.do("POST", base, c.np("/spawn"), tok, map[string]any{
 		"name": name, "cmd": cmd, "cwd": cwd,
 		"grant_control": grantControl, "wait_ready": waitReady, "headed": headed,
+		"persist": persist,
 	}, &out)
 	return out, err
 }
@@ -562,7 +563,7 @@ func (c *Client) Read(agent string, lines int) (string, error) {
 	return out.Screen, err
 }
 
-func (c *Client) Kill(agent string) (killed bool, err error) {
+func (c *Client) Kill(agent string, forget bool) (killed bool, err error) {
 	base, full, tok, err := c.controlTarget(agent)
 	if err != nil {
 		return false, err
@@ -570,6 +571,6 @@ func (c *Client) Kill(agent string) (killed bool, err error) {
 	var out struct {
 		Killed bool `json:"killed"`
 	}
-	err = c.do("POST", base, c.np("/kill"), tok, map[string]string{"agent": full}, &out)
+	err = c.do("POST", base, c.np("/kill"), tok, map[string]any{"agent": full, "forget": forget}, &out)
 	return out.Killed, err
 }

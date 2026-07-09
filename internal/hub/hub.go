@@ -40,9 +40,10 @@ type Hub struct {
 }
 
 type network struct {
-	name string
-	dir  string
-	reg  *store.Registry
+	name    string
+	dir     string
+	reg     *store.Registry
+	persist *store.PersistStore // declared sessions the daemon keeps alive
 
 	// regMu serializes name claims (register/spawn): the aliveness
 	// probes and tmux calls between the taken-check and the registry
@@ -89,12 +90,16 @@ func (h *Hub) net(name string) (*network, error) {
 	if err != nil {
 		return nil, err
 	}
+	persist, err := store.OpenPersist(dir)
+	if err != nil {
+		return nil, err
+	}
 	audit, err := os.OpenFile(filepath.Join(dir, "audit.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, err
 	}
 	n := &network{
-		name: name, dir: dir, reg: reg, cfg: cfg,
+		name: name, dir: dir, reg: reg, persist: persist, cfg: cfg,
 		inboxes:   map[string]*store.Inbox{},
 		lastNudge: map[string]time.Time{},
 		audit:     audit,

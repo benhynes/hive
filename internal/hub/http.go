@@ -570,7 +570,8 @@ type spawnReq struct {
 	Cwd          string   `json:"cwd,omitempty"`
 	GrantControl bool     `json:"grant_control,omitempty"`
 	WaitReady    bool     `json:"wait_ready,omitempty"`
-	Headed       bool     `json:"headed,omitempty"` // open a visible terminal window attached to the session
+	Headed       bool     `json:"headed,omitempty"`  // open a visible terminal window attached to the session
+	Persist      bool     `json:"persist,omitempty"` // declare it: the daemon respawns it after reboot/crash
 }
 
 type spawnResp struct {
@@ -596,31 +597,28 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 	}
 	session := "hive-" + n.name + "-" + req.Name
 
-	tok := proto.NewToken()
-	bindHost := h.Cfg.Bind
-	if bindHost == "0.0.0.0" || bindHost == "::" || bindHost == "" {
-		bindHost = "127.0.0.1"
-	}
-	env := map[string]string{
-		"HIVE_ADDR":  fmt.Sprintf("http://%s", net.JoinHostPort(bindHost, strconv.Itoa(h.Cfg.Port))),
-		"HIVE_NET":   n.name,
-		"HIVE_AGENT": req.Name + "@" + h.Cfg.HostName,
-		"HIVE_TOKEN": tok,
-	}
-	if req.GrantControl {
-		n.mu.Lock()
-		ctl := n.cfg.ControlToken
-		n.mu.Unlock()
-		if ctl == "" {
-			httpErr(w, 400, "this host has no control token to grant")
-			return
-		}
-		env["HIVE_CONTROL_TOKEN"] = ctl
+	tok, env, err := h.spawnEnv(n, req)
+	if err != nil {
+		httpErr(w, 400, "%v", err)
+		return
 	}
 
-	rec, ok := h.claimAndSpawn(w, r, n, id, req, session, tok, env)
-	if !ok {
+	rec, serr := h.spawnCore(n, h.actor(r, id), req, session, tok, env)
+	if serr != nil {
+		httpErr(w, serr.code, "%s", serr.msg)
 		return
+	}
+	if req.Persist {
+		spec := store.PersistSpec{
+			Name: req.Name, Cmd: req.Cmd, Cwd: req.Cwd,
+			GrantControl: req.GrantControl, Declared: time.Now().UnixMilli(),
+		}
+		if err := n.persist.Put(spec); err != nil {
+			// The spawn itself succeeded; a failed declaration must not
+			// silently pass for one.
+			httpErr(w, 500, "spawned, but could not persist the declaration: %v", err)
+			return
+		}
 	}
 	window := ""
 	if req.Headed {
@@ -646,16 +644,50 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 	})
 }
 
-// claimAndSpawn atomically claims the agent name and creates its tmux
+// spawnEnv mints the agent token and builds the spawn environment. It fails
+// only when control is requested and this host has no control token to grant.
+func (h *Hub) spawnEnv(n *network, req spawnReq) (string, map[string]string, error) {
+	tok := proto.NewToken()
+	bindHost := h.Cfg.Bind
+	if bindHost == "0.0.0.0" || bindHost == "::" || bindHost == "" {
+		bindHost = "127.0.0.1"
+	}
+	env := map[string]string{
+		"HIVE_ADDR":  fmt.Sprintf("http://%s", net.JoinHostPort(bindHost, strconv.Itoa(h.Cfg.Port))),
+		"HIVE_NET":   n.name,
+		"HIVE_AGENT": req.Name + "@" + h.Cfg.HostName,
+		"HIVE_TOKEN": tok,
+	}
+	if req.GrantControl {
+		n.mu.Lock()
+		ctl := n.cfg.ControlToken
+		n.mu.Unlock()
+		if ctl == "" {
+			return "", nil, fmt.Errorf("this host has no control token to grant")
+		}
+		env["HIVE_CONTROL_TOKEN"] = ctl
+	}
+	return tok, env, nil
+}
+
+// spawnErr is a spawn failure with the HTTP status it maps to, so the
+// reconcile loop can share spawnCore without an http.ResponseWriter.
+type spawnErr struct {
+	code int
+	msg  string
+}
+
+func (e *spawnErr) Error() string { return e.msg }
+
+// spawnCore atomically claims the agent name and creates its tmux
 // session + registry record, serialized by n.regMu against other
-// register/spawn calls. It writes the HTTP error response on failure.
-func (h *Hub) claimAndSpawn(w http.ResponseWriter, r *http.Request, n *network, id ident,
-	req spawnReq, session, tok string, env map[string]string) (store.AgentRec, bool) {
+// register/spawn calls.
+func (h *Hub) spawnCore(n *network, actor string,
+	req spawnReq, session, tok string, env map[string]string) (store.AgentRec, *spawnErr) {
 	n.regMu.Lock()
 	defer n.regMu.Unlock()
 	if old, ok := n.reg.Get(req.Name); ok && alive(old) {
-		httpErr(w, 409, "name %q is taken by a live agent", req.Name)
-		return store.AgentRec{}, false
+		return store.AgentRec{}, &spawnErr{409, fmt.Sprintf("name %q is taken by a live agent", req.Name)}
 	}
 	pane, pid, err := control.NewSession(session, req.Cwd, env, req.Cmd, req.Headed)
 	if errors.Is(err, control.ErrDuplicateSession) {
@@ -668,19 +700,17 @@ func (h *Hub) claimAndSpawn(w http.ResponseWriter, r *http.Request, n *network, 
 			control.KillSession(session, old.Pane)
 			pane, pid, err = control.NewSession(session, req.Cwd, env, req.Cmd, req.Headed)
 		} else {
-			httpErr(w, 409, "tmux session %q exists but is not owned by network %q — kill it manually", session, n.name)
-			return store.AgentRec{}, false
+			return store.AgentRec{}, &spawnErr{409,
+				fmt.Sprintf("tmux session %q exists but is not owned by network %q — kill it manually", session, n.name)}
 		}
 	}
 	if err != nil {
-		httpErr(w, 500, "spawn: %v", err)
-		return store.AgentRec{}, false
+		return store.AgentRec{}, &spawnErr{500, fmt.Sprintf("spawn: %v", err)}
 	}
 	epoch, err := control.ProcStartEpoch(pid)
 	if err != nil {
 		control.KillSession(session, pane)
-		httpErr(w, 500, "spawned process died immediately")
-		return store.AgentRec{}, false
+		return store.AgentRec{}, &spawnErr{500, "spawned process died immediately"}
 	}
 	rec := store.AgentRec{
 		Name: req.Name, TokenHash: proto.HashToken(tok),
@@ -689,12 +719,11 @@ func (h *Hub) claimAndSpawn(w http.ResponseWriter, r *http.Request, n *network, 
 	}
 	if err := n.reg.Put(rec); err != nil {
 		control.KillSession(session, pane)
-		httpErr(w, 500, "registry: %v", err)
-		return store.AgentRec{}, false
+		return store.AgentRec{}, &spawnErr{500, fmt.Sprintf("registry: %v", err)}
 	}
-	n.auditLine(h.actor(r, id), "spawn", rec.Name+"@"+h.Cfg.HostName,
-		fmt.Sprintf("cmd=%q grant_control=%v headed=%v", strings.Join(req.Cmd, " "), req.GrantControl, req.Headed))
-	return rec, true
+	n.auditLine(actor, "spawn", rec.Name+"@"+h.Cfg.HostName,
+		fmt.Sprintf("cmd=%q grant_control=%v headed=%v persist=%v", strings.Join(req.Cmd, " "), req.GrantControl, req.Headed, req.Persist))
+	return rec, nil
 }
 
 // localControllable resolves an agent arg (name or name@thishost) to a
@@ -844,7 +873,8 @@ func (h *Hub) hStream(w http.ResponseWriter, r *http.Request, n *network, id ide
 
 func (h *Hub) hKill(w http.ResponseWriter, r *http.Request, n *network, id ident) {
 	var req struct {
-		Agent string `json:"agent"`
+		Agent  string `json:"agent"`
+		Forget bool   `json:"forget,omitempty"` // also drop its persist declaration
 	}
 	if !readJSON(w, r, &req) {
 		return
@@ -852,8 +882,32 @@ func (h *Hub) hKill(w http.ResponseWriter, r *http.Request, n *network, id ident
 	name := strings.TrimSuffix(req.Agent, "@"+h.Cfg.HostName)
 	rec, ok := n.reg.Get(name)
 	if !ok {
+		// A declared-but-dead session has no registry record; forgetting it
+		// must still work, else the reconciler resurrects it forever.
+		if req.Forget {
+			if _, declared := n.persist.Get(name); declared {
+				if err := n.persist.Delete(name); err != nil {
+					httpErr(w, 500, "persist: %v", err)
+					return
+				}
+				n.auditLine(h.actor(r, id), "kill", name+"@"+h.Cfg.HostName, "forgot declaration (no live agent)")
+				writeJSON(w, 200, map[string]any{"killed": false, "deregistered": false, "forgotten": true})
+				return
+			}
+		}
 		httpErr(w, 404, "no such agent")
 		return
+	}
+	// Drop the declaration BEFORE killing: the reconciler must not race the
+	// kill and respawn what the caller is tearing down. A plain kill leaves
+	// the declaration, so a declared agent comes back on the next sweep.
+	forgotten := false
+	if req.Forget {
+		if err := n.persist.Delete(name); err != nil {
+			httpErr(w, 500, "persist: %v", err)
+			return
+		}
+		forgotten = true
 	}
 	killed := false
 	if rec.Spawned && rec.Session != "" {
@@ -865,8 +919,8 @@ func (h *Hub) hKill(w http.ResponseWriter, r *http.Request, n *network, id ident
 		httpErr(w, 500, "registry: %v", err)
 		return
 	}
-	n.auditLine(h.actor(r, id), "kill", name+"@"+h.Cfg.HostName, fmt.Sprintf("killed_session=%v", killed))
-	writeJSON(w, 200, map[string]any{"killed": killed, "deregistered": true})
+	n.auditLine(h.actor(r, id), "kill", name+"@"+h.Cfg.HostName, fmt.Sprintf("killed_session=%v forgotten=%v", killed, forgotten))
+	writeJSON(w, 200, map[string]any{"killed": killed, "deregistered": true, "forgotten": forgotten})
 }
 
 // ---- hub-to-hub ----

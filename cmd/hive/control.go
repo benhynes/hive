@@ -14,17 +14,18 @@ func runSpawn(args []string) error {
 	grant := fs.Bool("grant-control", false, "inject the network control token (CONTROL layer)")
 	waitReady := fs.Bool("wait", false, "wait until the pane draws and goes quiet")
 	headed := fs.Bool("headed", false, "open a visible terminal window on the target host attached to the session")
+	persist := fs.Bool("persist", false, "declare the session: the daemon respawns it after reboot or crash")
 	fs.Parse2()
 	name := fs.pos(0)
 	cmd := fs.afterDD
 	if name == "" || len(cmd) == 0 {
-		return fmt.Errorf("usage: hive spawn [--host H] [--cwd D] [--grant-control] [--wait] [--headed] <name> -- CMD...")
+		return fmt.Errorf("usage: hive spawn [--host H] [--cwd D] [--grant-control] [--wait] [--headed] [--persist] <name> -- CMD...")
 	}
 	c, err := client.Resolve(*fs.net)
 	if err != nil {
 		return err
 	}
-	res, err := c.Spawn(*host, name, cmd, *cwd, *grant, *waitReady, *headed)
+	res, err := c.Spawn(*host, name, cmd, *cwd, *grant, *waitReady, *headed, *persist)
 	if err != nil {
 		return err
 	}
@@ -42,6 +43,9 @@ func runSpawn(args []string) error {
 	}
 	if *grant {
 		fmt.Printf("  control: granted (HIVE_CONTROL_TOKEN injected)\n")
+	}
+	if *persist {
+		fmt.Printf("  persist: declared (daemon respawns it after reboot/crash; remove with hive kill --forget)\n")
 	}
 	if *headed {
 		if res.Window == "opened" {
@@ -97,16 +101,17 @@ func runRead(args []string) error {
 
 func runKill(args []string) error {
 	fs := flags("kill", args)
+	forget := fs.Bool("forget", false, "also drop the persist declaration (else a declared agent respawns)")
 	fs.Parse2()
 	agent := fs.pos(0)
 	if agent == "" {
-		return fmt.Errorf("usage: hive kill <agent>")
+		return fmt.Errorf("usage: hive kill [--forget] <agent>")
 	}
 	c, err := client.Resolve(*fs.net)
 	if err != nil {
 		return err
 	}
-	killed, err := c.Kill(agent)
+	killed, err := c.Kill(agent, *forget)
 	if err != nil {
 		return err
 	}
@@ -114,6 +119,9 @@ func runKill(args []string) error {
 		fmt.Printf("killed %s (session terminated, deregistered)\n", agent)
 	} else {
 		fmt.Printf("deregistered %s (no live session to kill)\n", agent)
+	}
+	if *forget {
+		fmt.Printf("  persist: declaration removed\n")
 	}
 	return nil
 }

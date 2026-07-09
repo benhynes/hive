@@ -103,6 +103,7 @@ func runDaemon(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	fmt.Printf("hive daemon: host=%s listening on %s:%d\n", cfg.HostName, cfg.Bind, cfg.Port)
+	go h.Reconcile(ctx)
 	return h.ListenAndServe(ctx)
 }
 
@@ -137,10 +138,11 @@ HOSTS (control layer)
                                            bootstrap a new host over ssh
 
 CONTROL (control layer; goes direct to the target host)
-  hive spawn [--host H] [--cwd D] [--grant-control] [--wait] [--headed] <name> -- CMD...
+  hive spawn [--host H] [--cwd D] [--grant-control] [--wait] [--headed] [--persist] <name> -- CMD...
+                                            --persist: daemon respawns it after reboot/crash
   hive keys [--enter] <agent> <text...>
   hive read [--lines N] <agent>
-  hive kill <agent>
+  hive kill [--forget] <agent>            --forget drops the persist declaration too
   hive dash [--web] [--bind A] [--port N] [--open=false]
                                            web dashboard: live grid of every
                                            agent's screen + status, zoom to

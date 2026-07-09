@@ -471,7 +471,7 @@ func (d *dash) hKill(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, err)
 		return
 	}
-	killed, err := d.c.Kill(req.Agent)
+	killed, err := d.c.Kill(req.Agent, false)
 	if err != nil {
 		apiErr(w, err)
 		return
