@@ -801,16 +801,71 @@ func (h *Hub) hKeys(w http.ResponseWriter, r *http.Request, n *network, id ident
 			err = control.SendKeysLiteral(rec.Pane, req.Text)
 		}
 	}
+	submitted := 0
 	if err == nil && req.Enter {
-		err = control.Enter(rec.Pane)
+		if req.Raw || req.Text == "" {
+			err = control.Enter(rec.Pane)
+		} else {
+			// Verified submit: an Enter sent while the TUI is still digesting
+			// the text can be swallowed, leaving it parked unsubmitted in the
+			// input box while the agent idles. Give the TUI a beat, then
+			// retry while the text still sits on the input line.
+			submitted, err = verifiedEnter(rec.Pane, req.Text)
+		}
 	}
 	if err != nil {
 		httpErr(w, 500, "keys: %v", err)
 		return
 	}
 	n.auditLine(h.actor(r, id), "keys", rec.Name+"@"+h.Cfg.HostName,
-		fmt.Sprintf("%dB enter=%v", len(req.Text), req.Enter))
+		fmt.Sprintf("%dB enter=%v attempts=%d", len(req.Text), req.Enter, submitted))
 	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// verifiedEnter submits typed text and confirms it left the input line,
+// retrying while it sits parked. The parked check only recognizes a
+// "❯"-prompt input box (Claude Code style); any other TUI gets exactly one
+// Enter, unverified, as before. Persistent parking is an error — the caller
+// must not mistake a parked directive for a delivered one.
+func verifiedEnter(pane, text string) (int, error) {
+	time.Sleep(700 * time.Millisecond)
+	for attempt := 1; ; attempt++ {
+		if err := control.Enter(pane); err != nil {
+			return attempt, err
+		}
+		time.Sleep(1500 * time.Millisecond)
+		cap, err := control.Capture(pane, 0)
+		if err != nil || !keysParked(cap, text) {
+			return attempt, nil
+		}
+		if attempt >= 4 {
+			return attempt, fmt.Errorf("text parked unsubmitted after %d Enter attempts (pane input wedged)", attempt)
+		}
+		time.Sleep(time.Duration(attempt) * time.Second)
+	}
+}
+
+// keysParked reports whether text still sits unsubmitted on the pane's input
+// line: the LAST line starting with "❯" is the input box; submitted text
+// never re-echoes there.
+func keysParked(pane, text string) bool {
+	first := text
+	if i := strings.IndexAny(first, "\r\n"); i >= 0 {
+		first = first[:i]
+	}
+	if len(first) > 40 {
+		first = first[:40]
+	}
+	if first == "" {
+		return false
+	}
+	prompt := ""
+	for _, ln := range strings.Split(pane, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(ln), "❯") {
+			prompt = ln
+		}
+	}
+	return prompt != "" && strings.Contains(prompt, first)
 }
 
 func (h *Hub) hRead(w http.ResponseWriter, r *http.Request, n *network, id ident) {
