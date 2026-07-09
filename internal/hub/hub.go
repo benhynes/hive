@@ -32,10 +32,11 @@ const nudgeEvery = 30 * time.Second
 
 // Hub is one host's daemon state.
 type Hub struct {
-	Cfg    config.Config
-	mu     sync.Mutex
-	nets   map[string]*network
-	client *http.Client // hub->hub calls
+	Cfg     config.Config
+	mu      sync.Mutex
+	nets    map[string]*network
+	client  *http.Client // hub->hub calls
+	streams *streams     // live pane-output fan-out (pipe-pane)
 }
 
 type network struct {
@@ -61,9 +62,10 @@ type network struct {
 // New creates a hub for the given host config.
 func New(cfg config.Config) *Hub {
 	return &Hub{
-		Cfg:    cfg,
-		nets:   map[string]*network{},
-		client: &http.Client{Timeout: 3500 * time.Millisecond},
+		Cfg:     cfg,
+		nets:    map[string]*network{},
+		client:  &http.Client{Timeout: 3500 * time.Millisecond},
+		streams: newStreams(filepath.Join(config.Home(), "streams")),
 	}
 }
 

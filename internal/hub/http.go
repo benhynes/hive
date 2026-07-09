@@ -109,6 +109,7 @@ func (h *Hub) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/nets/{net}/spawn", h.withNet(accControl, h.hSpawn))
 	mux.HandleFunc("POST /v1/nets/{net}/keys", h.withNet(accControl, h.hKeys))
 	mux.HandleFunc("GET /v1/nets/{net}/read", h.withNet(accControl, h.hRead))
+	mux.HandleFunc("GET /v1/nets/{net}/stream", h.withNet(accControl, h.hStream))
 	mux.HandleFunc("POST /v1/nets/{net}/kill", h.withNet(accControl, h.hKill))
 	return mux
 }
@@ -737,6 +738,7 @@ func (h *Hub) hKeys(w http.ResponseWriter, r *http.Request, n *network, id ident
 		Agent string `json:"agent"`
 		Text  string `json:"text"`
 		Enter bool   `json:"enter,omitempty"`
+		Raw   bool   `json:"raw,omitempty"` // terminal input: never bracketed-paste
 	}
 	if !readJSON(w, r, &req) {
 		return
@@ -747,7 +749,7 @@ func (h *Hub) hKeys(w http.ResponseWriter, r *http.Request, n *network, id ident
 	}
 	var err error
 	if req.Text != "" {
-		if strings.ContainsAny(req.Text, "\n\r") {
+		if !req.Raw && strings.ContainsAny(req.Text, "\n\r") {
 			err = control.Paste(rec.Pane, req.Text)
 		} else {
 			err = control.SendKeysLiteral(rec.Pane, req.Text)
@@ -778,6 +780,69 @@ func (h *Hub) hRead(w http.ResponseWriter, r *http.Request, n *network, id ident
 	}
 	n.auditLine(h.actor(r, id), "read", rec.Name+"@"+h.Cfg.HostName, fmt.Sprintf("lines=%d", lines))
 	writeJSON(w, 200, map[string]any{"agent": rec.Name + "@" + h.Cfg.HostName, "screen": out})
+}
+
+// hStream sends the pane's screen (escape sequences + cursor position),
+// then live raw output until the client disconnects or the pane dies.
+// Pane geometry rides in headers so a terminal emulator can size itself
+// before the first byte. One tmux pipe-pane feeds all concurrent
+// streams; see internal/hub/stream.go.
+func (h *Hub) hStream(w http.ResponseWriter, r *http.Request, n *network, id ident) {
+	if !control.StreamSupported() {
+		httpErr(w, 501, "pane streaming is not supported on this host")
+		return
+	}
+	rec, ok := h.localControllable(w, n, r.URL.Query().Get("agent"))
+	if !ok {
+		return
+	}
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		httpErr(w, 500, "streaming unsupported by server")
+		return
+	}
+	cols, rows, err := control.PaneSize(rec.Pane)
+	if err != nil {
+		httpErr(w, 500, "pane size: %v", err)
+		return
+	}
+	// Subscribe before the snapshot: output between the two is then
+	// delivered rather than lost (duplicated bytes just redraw).
+	ch, cancel, err := h.streams.Subscribe(rec.Pane)
+	if err != nil {
+		httpErr(w, 500, "stream: %v", err)
+		return
+	}
+	defer cancel()
+	snap, err := control.CaptureRaw(rec.Pane)
+	if err != nil {
+		httpErr(w, 500, "capture: %v", err)
+		return
+	}
+	n.auditLine(h.actor(r, id), "stream", rec.Name+"@"+h.Cfg.HostName, "open")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("X-Hive-Cols", strconv.Itoa(cols))
+	w.Header().Set("X-Hive-Rows", strconv.Itoa(rows))
+	w.WriteHeader(200)
+	if _, err := w.Write([]byte(snap)); err != nil {
+		return
+	}
+	fl.Flush()
+	ctx := r.Context()
+	for {
+		select {
+		case chunk, ok := <-ch:
+			if !ok {
+				return // pane died or we fell behind; client reconnects
+			}
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+			fl.Flush()
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (h *Hub) hKill(w http.ResponseWriter, r *http.Request, n *network, id ident) {

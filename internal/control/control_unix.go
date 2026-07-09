@@ -49,6 +49,24 @@ func Paste(pane, text string) error { return tmux.Paste(pane, text) }
 // much scrollback.
 func Capture(pane string, lines int) (string, error) { return tmux.Capture(pane, lines) }
 
+// CaptureRaw returns the visible pane content with escape sequences and
+// a trailing cursor-position escape — a snapshot a terminal emulator
+// can replay.
+func CaptureRaw(pane string) (string, error) { return tmux.CaptureRaw(pane) }
+
+// PaneSize returns the pane's columns and rows.
+func PaneSize(pane string) (cols, rows int, err error) { return tmux.PaneSize(pane) }
+
+// PipeOpen starts piping the pane's raw output into path (a FIFO).
+func PipeOpen(pane, path string) error { return tmux.PipeOpen(pane, path) }
+
+// PipeClose stops piping the pane's output.
+func PipeClose(pane string) error { return tmux.PipeClose(pane) }
+
+// StreamSupported reports whether live pane streaming works on this
+// platform (pipe-pane is tmux-only).
+func StreamSupported() bool { return true }
+
 // KillSession terminates a session and everything in it. The pane id is
 // unused on Unix (tmux kills by session name).
 func KillSession(session, _ string) error { return tmux.KillSession(session) }

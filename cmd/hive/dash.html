@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>hive dash</title>
+<link rel="stylesheet" href="/assets/xterm.min.css">
+<script src="/assets/xterm.min.js"></script>
 <style>
   :root {
     --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#e6edf3; --dim:#8b949e;
@@ -53,11 +55,14 @@
   #zoom[hidden] { display:none; }
   #zbox { background:var(--panel); border:1px solid var(--border); border-radius:10px;
           width:min(1200px,100%); max-height:100%; display:flex; flex-direction:column; }
+  #zbox.term { width:min(1680px,100%); }
   #zhead { display:flex; align-items:center; gap:10px; padding:10px 14px;
            border-bottom:1px solid var(--border); flex-wrap:wrap; }
   #zhead .aname { font-size:15px; }
   #zscreen { font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; color:#c9d1d9;
              padding:12px 14px; overflow:auto; white-space:pre; flex:1; min-height:200px; }
+  #zterm { flex:1; min-height:200px; overflow:auto; padding:8px 10px; background:#0d1117; }
+  #zterm .xterm { height:100%; }
   #zctl { display:flex; gap:6px; padding:10px 14px; border-top:1px solid var(--border);
           flex-wrap:wrap; align-items:center; }
   #ztext { flex:1; min-width:220px; }
@@ -106,9 +111,10 @@
       <button id="zclose">close ✕</button>
       <span id="zerr"></span>
     </div>
+    <div id="zterm" hidden></div>
     <pre id="zscreen"></pre>
     <div id="zctl">
-      <input type="text" id="ztext" placeholder="type text… (Enter sends + submits)">
+      <input type="text" id="ztext" placeholder="paste / type long text… (Enter sends + submits)">
       <button id="zsend">send</button>
       <button id="zsendenter">send ⏎</button>
       <div class="keyrow">
@@ -120,7 +126,7 @@
         <button data-key="stab">⇧Tab</button>
         <button data-key="ctrlc">^C</button>
       </div>
-      <span id="zmode">keys pass through when the text box isn't focused</span>
+      <span id="zmode"></span>
     </div>
   </div>
 </div>
@@ -162,9 +168,16 @@ async function api(path, opts) {
   return body;
 }
 
+let hashOpened = false;
 async function poll() {
   try {
     state = await api("/api/state");
+    // Deep link: #z=<agent id> opens that agent's zoom on load.
+    if (!hashOpened) {
+      hashOpened = true;
+      const m = location.hash.match(/^#z=(.+)$/);
+      if (m && agentById(decodeURIComponent(m[1]))) openZoom(decodeURIComponent(m[1]));
+    }
   } catch (e) {
     $("unreach").textContent = "dash server unreachable: " + e.message;
     setTimeout(poll, 1500);
@@ -276,6 +289,11 @@ function render() {
 // ---- zoom ----
 function agentById(id) { return state.agents.find(a => a.id === id); }
 
+// Live-terminal state. When the hub supports /stream, the zoom is a
+// real xterm.js terminal fed by the pane's raw output; keystrokes go
+// back raw. Old hubs (404/501) fall back to the poll view.
+let term = null, termAbort = null, termRetries = 0;
+
 function openZoom(id) {
   zoomId = id; zoomFrozen = false;
   $("zerr").textContent = ""; $("zfrozen").textContent = "";
@@ -284,9 +302,71 @@ function openZoom(id) {
   $("zoom").hidden = false;
   renderZoom();
   $("zscreen").scrollTop = $("zscreen").scrollHeight;
+  termRetries = 0;
+  startStream(id);
 }
 
-function closeZoom() { zoomId = null; $("zoom").hidden = true; }
+function stopStream() {
+  if (termAbort) { termAbort.abort(); termAbort = null; }
+  if (term) { term.dispose(); term = null; }
+  $("zbox").classList.remove("term");
+  $("zterm").hidden = true; $("zterm").innerHTML = "";
+  $("zscreen").hidden = false;
+  $("zscroll").hidden = false;
+  $("zmode").textContent = "keys pass through when the text box isn't focused";
+}
+
+async function startStream(id) {
+  const ac = new AbortController();
+  termAbort = ac;
+  let resp;
+  try {
+    resp = await fetch("/api/stream?agent=" + encodeURIComponent(id),
+      {headers: {"X-Dash-Token": TOKEN}, signal: ac.signal});
+  } catch (e) { return; } // aborted or network — poll view stays
+  if (zoomId !== id || ac !== termAbort) { try { resp.body.cancel(); } catch (e) {} return; }
+  if (!resp.ok) { stopStream(); return; } // hub without /stream → poll view
+  const cols = parseInt(resp.headers.get("X-Hive-Cols")) || 220;
+  const rows = parseInt(resp.headers.get("X-Hive-Rows")) || 50;
+  $("zscreen").hidden = true;
+  $("zscroll").hidden = true; // xterm keeps its own scrollback
+  $("zbox").classList.add("term");
+  $("zterm").hidden = false;
+  // Fit the pane's fixed width into the box: monospace glyphs are
+  // ~0.6em wide, so pick the largest font that fits, clamped readable.
+  const avail = $("zterm").clientWidth - 24;
+  const fontSize = Math.max(8, Math.min(16, Math.floor(avail / cols / 0.6)));
+  term = new Terminal({cols, rows, scrollback: 5000, fontSize,
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    theme: {background: "#0d1117", foreground: "#c9d1d9"}});
+  term.open($("zterm"));
+  term.onData(data => { if (zoomId) sendKeys(data, false, true); });
+  term.focus();
+  $("zmode").textContent = "live terminal — keys go straight to the pane";
+  const reader = resp.body.getReader();
+  try {
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      if (term) term.write(value);
+      termRetries = 0;
+    }
+  } catch (e) { /* aborted or dropped */ }
+  // Stream ended. If the zoom is still open and the agent alive,
+  // reconnect (fresh snapshot); after 3 straight failures fall back.
+  if (zoomId === id && ac === termAbort) {
+    const a = agentById(id);
+    if (a && a.alive && termRetries++ < 3) {
+      if (term) { term.dispose(); term = null; }
+      $("zterm").innerHTML = "";
+      setTimeout(() => { if (zoomId === id && ac === termAbort) startStream(id); }, 800);
+    } else {
+      stopStream();
+    }
+  }
+}
+
+function closeZoom() { zoomId = null; stopStream(); $("zoom").hidden = true; }
 
 function renderZoom() {
   const a = agentById(zoomId);
@@ -295,6 +375,7 @@ function renderZoom() {
   $("zstat").textContent = a.status;
   $("zstat").style.color = "var(--" + a.status + ")";
   document.querySelector("#zhead .dot").style.background = "var(--" + a.status + ")";
+  if (term) return; // live terminal renders itself
   if (!zoomFrozen) {
     const el = $("zscreen");
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
@@ -306,12 +387,13 @@ function renderZoom() {
 // Keystrokes are queued through one promise chain: concurrent POSTs on
 // separate connections could reach the pane out of order.
 let keyQueue = Promise.resolve();
-function sendKeys(text, enter) {
+function sendKeys(text, enter, raw) {
   if (!zoomId) return;
   const agent = zoomId;
   $("zerr").textContent = "";
   keyQueue = keyQueue.then(async () => {
-    try { await api("/api/keys", {method:"POST", body:JSON.stringify({agent, text, enter:!!enter})}); }
+    try { await api("/api/keys", {method:"POST",
+      body:JSON.stringify({agent, text, enter:!!enter, raw:!!raw})}); }
     catch (e) { $("zerr").textContent = "keys: " + e.message; }
   });
 }
@@ -323,7 +405,11 @@ $("ztext").addEventListener("keydown", e => {
   e.stopPropagation();
 });
 for (const b of document.querySelectorAll(".keyrow button"))
-  b.onclick = () => { const k = KEYS[b.dataset.key]; sendKeys(k.text, !!k.enter); };
+  b.onclick = () => {
+    const k = KEYS[b.dataset.key];
+    if (term) { sendKeys(k.enter ? "\r" : k.text, false, true); term.focus(); }
+    else sendKeys(k.text, !!k.enter);
+  };
 
 $("zclose").onclick = closeZoom;
 $("zoom").addEventListener("click", e => { if (e.target === $("zoom")) closeZoom(); });
@@ -363,6 +449,7 @@ $("zlive").onclick = () => {
 // pass-through keyboard when zoomed and the text box isn't focused
 document.addEventListener("keydown", e => {
   if (!zoomId) return;
+  if (term) return; // live terminal: xterm.js owns the keyboard
   if (document.activeElement === $("ztext")) return;
   if (e.metaKey || e.altKey) return; // leave browser/OS shortcuts alone
   const map = {Enter:KEYS.enter, Escape:KEYS.esc, ArrowUp:KEYS.up, ArrowDown:KEYS.down,

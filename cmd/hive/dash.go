@@ -30,7 +30,7 @@ import (
 	"sync"
 	"time"
 
-	_ "embed"
+	"embed"
 
 	"github.com/benhynes/hive/internal/client"
 	"github.com/benhynes/hive/internal/proto"
@@ -38,6 +38,11 @@ import (
 
 //go:embed dash.html
 var dashHTML string
+
+// Vendored xterm.js (MIT) renders the zoomed pane as a real terminal.
+//
+//go:embed assets
+var dashAssets embed.FS
 
 func runDash(args []string) error {
 	fs := flags("dash", args)
@@ -311,8 +316,10 @@ func (d *dash) handler(addr string) http.Handler {
 		page = strings.ReplaceAll(page, "{{NET}}", d.c.Net)
 		w.Write([]byte(page))
 	})
+	mux.Handle("GET /assets/", http.FileServerFS(dashAssets))
 	mux.HandleFunc("GET /api/state", d.api(d.hState))
 	mux.HandleFunc("GET /api/read", d.api(d.hReadOnce))
+	mux.HandleFunc("GET /api/stream", d.api(d.hStream))
 	mux.HandleFunc("POST /api/keys", d.api(d.hKeys))
 	mux.HandleFunc("POST /api/kill", d.api(d.hKill))
 	return d.hostCheck(addr, mux)
@@ -402,16 +409,58 @@ func (d *dash) hKeys(w http.ResponseWriter, r *http.Request) {
 		Agent string `json:"agent"`
 		Text  string `json:"text"`
 		Enter bool   `json:"enter"`
+		Raw   bool   `json:"raw"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		apiErr(w, err)
 		return
 	}
-	if err := d.c.Keys(req.Agent, req.Text, req.Enter); err != nil {
+	var err error
+	if req.Raw {
+		err = d.c.KeysRaw(req.Agent, req.Text)
+	} else {
+		err = d.c.Keys(req.Agent, req.Text, req.Enter)
+	}
+	if err != nil {
 		apiErr(w, err)
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+}
+
+// hStream proxies the hub's live pane stream to the browser. Geometry
+// rides through in the same headers; the body is raw terminal bytes the
+// page feeds straight into xterm.js.
+func (d *dash) hStream(w http.ResponseWriter, r *http.Request) {
+	agent := r.URL.Query().Get("agent")
+	s, err := d.c.Stream(agent)
+	if err != nil {
+		apiErr(w, err)
+		return
+	}
+	defer s.Body.Close()
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		apiErr(w, fmt.Errorf("streaming unsupported"))
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("X-Hive-Cols", strconv.Itoa(s.Cols))
+	w.Header().Set("X-Hive-Rows", strconv.Itoa(s.Rows))
+	w.WriteHeader(200)
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := s.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+			fl.Flush()
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 func (d *dash) hKill(w http.ResponseWriter, r *http.Request) {

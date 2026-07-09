@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -477,12 +478,62 @@ func (c *Client) controlTarget(agent string) (string, string, string, error) {
 }
 
 func (c *Client) Keys(agent, text string, enter bool) error {
+	return c.keys(agent, text, enter, false)
+}
+
+// KeysRaw types text with no paste-mode heuristics — terminal input
+// (\r for Enter, escape bytes) goes to the pane exactly as given.
+func (c *Client) KeysRaw(agent, text string) error {
+	return c.keys(agent, text, false, true)
+}
+
+func (c *Client) keys(agent, text string, enter, raw bool) error {
 	base, full, tok, err := c.controlTarget(agent)
 	if err != nil {
 		return err
 	}
 	return c.do("POST", base, c.np("/keys"), tok,
-		map[string]any{"agent": full, "text": text, "enter": enter}, nil)
+		map[string]any{"agent": full, "text": text, "enter": enter, "raw": raw}, nil)
+}
+
+// StreamResp is a live pane-output stream: the screen snapshot, then
+// raw output until closed. Callers must Close the Body.
+type StreamResp struct {
+	Body       io.ReadCloser
+	Cols, Rows int
+}
+
+// Stream opens a live output stream for an agent's pane. It uses a
+// dedicated non-timing-out HTTP client — the shared one's Timeout
+// covers the whole response body and would sever the stream.
+func (c *Client) Stream(agent string) (*StreamResp, error) {
+	base, full, tok, err := c.controlTarget(agent)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest("GET", base+c.np("/stream?agent="+url.QueryEscape(full)), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		var e struct {
+			Error string `json:"error"`
+		}
+		json.NewDecoder(resp.Body).Decode(&e)
+		resp.Body.Close()
+		if e.Error == "" {
+			e.Error = resp.Status
+		}
+		return nil, fmt.Errorf("%s", e.Error)
+	}
+	cols, _ := strconv.Atoi(resp.Header.Get("X-Hive-Cols"))
+	rows, _ := strconv.Atoi(resp.Header.Get("X-Hive-Rows"))
+	return &StreamResp{Body: resp.Body, Cols: cols, Rows: rows}, nil
 }
 
 func (c *Client) Read(agent string, lines int) (string, error) {
