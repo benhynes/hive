@@ -78,23 +78,36 @@ func Resolve(netFlag string) (*Client, error) {
 			return nil, fmt.Errorf("multiple networks (%s) — pass --net or set HIVE_NET", strings.Join(nets, ", "))
 		}
 	}
+	nc, haveNet := config.NetConfig{}, false
+	if n, err := config.LoadNet(c.Net); err == nil {
+		nc, haveNet = n, true
+	}
 	c.Token = os.Getenv("HIVE_TOKEN")
 	c.Control = os.Getenv("HIVE_CONTROL_TOKEN")
-	if c.Token == "" || c.Control == "" {
-		if n, err := config.LoadNet(c.Net); err == nil {
-			if c.Control == "" {
-				c.Control = n.ControlToken
-			}
+	if (c.Token == "" || c.Control == "") && haveNet {
+		if c.Control == "" {
+			c.Control = nc.ControlToken
+		}
+		if c.Token == "" {
+			c.Token = nc.ControlToken
 			if c.Token == "" {
-				c.Token = n.ControlToken
-				if c.Token == "" {
-					c.Token = n.MsgToken
-				}
+				c.Token = nc.MsgToken
 			}
 		}
 	}
 	if c.Token == "" {
 		return nil, fmt.Errorf("no token: set HIVE_TOKEN or join network %q on this host", c.Net)
+	}
+	// Seed identity + routing from local config so Self()/hubFor() skip the
+	// GET /hosts round-trip that nearly every command otherwise pays. Only
+	// when talking to the local hub (HIVE_ADDR unset), whose self name is
+	// this host's config name; hubFor still refreshes live on a hosts miss,
+	// so a just-added peer resolves.
+	if os.Getenv("HIVE_ADDR") == "" {
+		c.self = cfg.HostName
+		if haveNet {
+			c.hosts = nc.Hosts
+		}
 	}
 	return c, nil
 }
@@ -215,16 +228,17 @@ func (c *Client) hubFor(host string) (string, error) {
 		return c.Addr, nil
 	}
 	c.mu.RLock()
-	hosts := c.hosts
+	addr, ok := c.hosts[host]
 	c.mu.RUnlock()
-	if hosts == nil {
-		res, err := c.Hosts()
+	if !ok {
+		// Not in the (possibly seeded, possibly stale) local map — ask the
+		// hub live, so a peer added since this process started resolves.
+		fresh, err := c.Hosts()
 		if err != nil {
 			return "", err
 		}
-		hosts = res.Hosts
+		addr, ok = fresh.Hosts[host]
 	}
-	addr, ok := hosts[host]
 	if !ok {
 		return "", fmt.Errorf("unknown host %q — add it with: hive hosts add %s <addr:port>", host, host)
 	}

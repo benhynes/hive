@@ -634,7 +634,10 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 	}
 	ready := false
 	if req.WaitReady {
-		time.Sleep(500 * time.Millisecond) // let the process draw its first frame
+		// No pre-sleep: WaitQuiescent's first capture/window/compare cycle
+		// already tolerates a not-yet-drawn frame (a still-drawing pane is
+		// simply non-quiescent and gets re-polled), so a fixed 500ms up
+		// front was pure dead time on every wait-ready spawn.
 		ready = control.WaitQuiescent(rec.Pane, 700*time.Millisecond, 15*time.Second)
 	}
 	writeJSON(w, 200, spawnResp{
@@ -654,7 +657,7 @@ func (h *Hub) claimAndSpawn(w http.ResponseWriter, r *http.Request, n *network, 
 		httpErr(w, 409, "name %q is taken by a live agent", req.Name)
 		return store.AgentRec{}, false
 	}
-	pane, err := control.NewSession(session, req.Cwd, env, req.Cmd, req.Headed)
+	pane, pid, err := control.NewSession(session, req.Cwd, env, req.Cmd, req.Headed)
 	if errors.Is(err, control.ErrDuplicateSession) {
 		// Reclaim only a session this network's registry owns (a dead
 		// registration or crash leftover). tmux's session namespace is
@@ -663,19 +666,13 @@ func (h *Hub) claimAndSpawn(w http.ResponseWriter, r *http.Request, n *network, 
 		// have no shared namespace and never collide.)
 		if old, ok := n.reg.Get(req.Name); ok && old.Session == session {
 			control.KillSession(session, old.Pane)
-			pane, err = control.NewSession(session, req.Cwd, env, req.Cmd, req.Headed)
+			pane, pid, err = control.NewSession(session, req.Cwd, env, req.Cmd, req.Headed)
 		} else {
 			httpErr(w, 409, "tmux session %q exists but is not owned by network %q — kill it manually", session, n.name)
 			return store.AgentRec{}, false
 		}
 	}
 	if err != nil {
-		httpErr(w, 500, "spawn: %v", err)
-		return store.AgentRec{}, false
-	}
-	pid, err := control.PanePID(pane)
-	if err != nil {
-		control.KillSession(session, pane)
 		httpErr(w, 500, "spawn: %v", err)
 		return store.AgentRec{}, false
 	}
