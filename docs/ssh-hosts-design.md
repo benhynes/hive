@@ -331,12 +331,19 @@ All five are settled; integration follows these.
 
 ## 9. Phased plan
 
-- **P1 — registration + provisioning (no SSH host yet):** spawn profiles +
-  `.mcp.json`/context auto-provisioning **including MCP-trust pre-seed** (§4)
-  applied to **local** spawns. Delivers the "appropriate context and MCP servers"
-  half immediately, testable without SSH — and the trust pre-seed must be
-  verified here (spawn a local agent, confirm it boots into `hive_recv` with no
-  trust prompt) since it's the likeliest silent-hang.
+- **P1 — registration + provisioning (no SSH host yet): DONE (2026-07-14).**
+  Spawn profiles (`~/.hive/profiles/*.json`, `--profile`, profile fields in
+  `hive_spawn`) + `.mcp.json`/context auto-provisioning **including the
+  MCP-trust pre-seed** applied to local spawns with a `--cwd`. The pre-seed
+  clears both gates in `~/.claude.json` (`hasTrustDialogAccepted` +
+  `enabledMcpjsonServers`, merged non-destructively). **Live-verified:** a real
+  Claude Code agent spawned into a provisioned cwd booted with zero prompts,
+  showed `hive · ✔ connected · 6 tools` in `/mcp`, and completed a full
+  nudge → `hive_recv` → `hive_send` reply loop. Code:
+  `internal/hub/provision.go`, `internal/config` profiles, spawn wiring.
+  Deferred within P1 scope: `repo` clone (P2, where SSH provisioning lands) and
+  the reconcile/respawn path does not re-provision (the on-disk `.mcp.json` +
+  trust survive, so respawned agents keep their wiring).
 - **P2 — SSH host bring-up:** `hosts add-ssh`, version-pinned binary ship,
   transient daemon over SSH, port allocator + tunnel manager, forward-spawn.
   Reuse node.go shipping. e2e against an OrbStack/tart VM.

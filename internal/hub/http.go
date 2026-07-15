@@ -602,6 +602,7 @@ type spawnReq struct {
 	Name         string   `json:"name"`
 	Cmd          []string `json:"cmd"`
 	Cwd          string   `json:"cwd,omitempty"`
+	Profile      string   `json:"profile,omitempty"` // spawn profile: context + MCP provisioning
 	GrantControl bool     `json:"grant_control,omitempty"`
 	WaitReady    bool     `json:"wait_ready,omitempty"`
 	Headed       bool     `json:"headed,omitempty"`  // open a visible terminal window attached to the session
@@ -625,10 +626,39 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 		httpErr(w, 400, "bad agent name")
 		return
 	}
+
+	// Resolve the spawn profile (context + MCP provisioning). Explicit request
+	// fields win over profile fields; a `-- CMD` overrides the profile runtime.
+	var prof config.SpawnProfile
+	if req.Profile != "" {
+		var err error
+		if prof, err = config.LoadProfile(req.Profile); err != nil {
+			httpErr(w, 400, "profile %q: %v", req.Profile, err)
+			return
+		}
+	}
 	if len(req.Cmd) == 0 {
-		httpErr(w, 400, "empty command")
+		req.Cmd = prof.Runtime
+	}
+	if len(req.Cmd) == 0 {
+		httpErr(w, 400, "empty command (give a `-- CMD` or a profile with a runtime)")
 		return
 	}
+	if req.Cwd == "" {
+		req.Cwd = prof.Cwd
+	}
+	req.Cwd = expandHome(req.Cwd)
+
+	// Provision the working directory (context files, .mcp.json, trust) before
+	// the runtime starts. Only when there is a cwd to write into — without one
+	// there is no project dir to seed, so a bare `spawn -- claude` is unchanged.
+	if req.Cwd != "" {
+		if err := provisionAgent(req.Cwd, prof, hiveBinPath()); err != nil {
+			httpErr(w, 500, "provision: %v", err)
+			return
+		}
+	}
+
 	session := "hive-" + n.name + "-" + req.Name
 
 	tok, env, err := h.spawnEnv(n, req)

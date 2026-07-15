@@ -349,7 +349,8 @@ func spawnTool(c *client.Client) Tool {
     "name":          {"type": "string", "description": "Agent name: lowercase [a-z0-9_-], unique on its host."},
     "cmd":           {"type": "array", "items": {"type": "string"}, "description": "Command to run, argv style. Not shell-interpreted."},
     "host":          {"type": "string", "description": "Host to spawn on (default: your own host)."},
-    "cwd":           {"type": "string", "description": "Working directory for the new agent."},
+    "cwd":           {"type": "string", "description": "Working directory for the new agent. Required for context/MCP provisioning to run."},
+    "profile":       {"type": "string", "description": "Spawn profile name: seeds context files + registers MCP servers (incl. hive) in the agent's cwd."},
     "grant_control": {"type": "boolean", "description": "Give the new agent the CONTROL credential too. It will be able to spawn and control other agents."},
     "wait_ready":    {"type": "boolean", "description": "Wait until the agent's pane stops changing (up to 15s) before returning."},
     "headed":        {"type": "boolean", "description": "Also open a visible terminal window on the target host so a human can watch."},
@@ -363,6 +364,7 @@ func spawnTool(c *client.Client) Tool {
 				Cmd          []string `json:"cmd"`
 				Host         string   `json:"host"`
 				Cwd          string   `json:"cwd"`
+				Profile      string   `json:"profile"`
 				GrantControl bool     `json:"grant_control"`
 				WaitReady    bool     `json:"wait_ready"`
 				Headed       bool     `json:"headed"`
@@ -374,7 +376,7 @@ func spawnTool(c *client.Client) Tool {
 			if a.Name == "" || len(a.Cmd) == 0 {
 				return "", fmt.Errorf("`name` and a non-empty `cmd` are required")
 			}
-			res, err := c.Spawn(a.Host, a.Name, a.Cmd, a.Cwd, a.GrantControl, a.WaitReady, a.Headed, a.Persist)
+			res, err := c.Spawn(a.Host, a.Name, a.Cmd, a.Cwd, a.Profile, a.GrantControl, a.WaitReady, a.Headed, a.Persist)
 			if err != nil {
 				return "", err
 			}

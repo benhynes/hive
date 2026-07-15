@@ -134,8 +134,12 @@ HOSTS (control layer)
                                            bootstrap a new host over ssh
 
 CONTROL (control layer; goes direct to the target host)
-  hive spawn [--host H] [--cwd D] [--grant-control] [--wait] [--headed] [--persist] <name> -- CMD...
+  hive spawn [--host H] [--cwd D] [--profile P] [--grant-control] [--wait] [--headed] [--persist] <name> [-- CMD...]
                                             --persist: daemon respawns it after reboot/crash
+                                            --profile: provision the cwd from ~/.hive/profiles/P.json
+                                            (context files + .mcp.json with the hive server,
+                                            pre-approved so a headless agent sees no prompts;
+                                            a profile runtime makes -- CMD optional)
   hive keys [--enter] <agent> <text...>
   hive read [--lines N] <agent>
   hive kill [--forget] <agent>            --forget drops the persist declaration too

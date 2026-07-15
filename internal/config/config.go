@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -54,6 +55,50 @@ func Home() string {
 func NetDir(net string) string { return filepath.Join(Home(), "nets", net) }
 
 func netPath(net string) string { return filepath.Join(NetDir(net), "net.json") }
+
+// ProfilesDir is where spawn profiles live (~/.hive/profiles/<name>.json).
+func ProfilesDir() string { return filepath.Join(Home(), "profiles") }
+
+// MCPServer is one entry in a spawned agent's .mcp.json.
+type MCPServer struct {
+	Command string            `json:"command"`
+	Args    []string          `json:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+}
+
+// SpawnProfile is a named provisioning spec applied when an agent is spawned:
+// what to run, where, and which context + MCP servers it boots with. It is
+// orthogonal to host type — the same profile applies to a local, tailnet, or
+// (later) SSH spawn.
+type SpawnProfile struct {
+	Runtime []string             `json:"runtime,omitempty"` // agent command; a `-- CMD` on spawn overrides it
+	Cwd     string               `json:"cwd,omitempty"`     // working dir on the target; --cwd overrides
+	Repo    string               `json:"repo,omitempty"`    // clone into cwd if cwd is empty (P2+; ignored for now)
+	Context []string             `json:"context,omitempty"` // files (abs or relative to the hub's cwd) seeded into cwd
+	MCP     map[string]MCPServer `json:"mcp,omitempty"`     // extra MCP servers registered for the agent
+	// NoHiveMCP opts out of auto-registering the `hive` MCP server. By default
+	// every provisioned agent gets it, so it is mesh-aware with zero setup.
+	NoHiveMCP bool `json:"no_hive_mcp,omitempty"`
+}
+
+var profileNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+
+// LoadProfile reads ~/.hive/profiles/<name>.json. The name is validated to
+// keep it from escaping the profiles directory.
+func LoadProfile(name string) (SpawnProfile, error) {
+	var p SpawnProfile
+	if !profileNameRe.MatchString(name) {
+		return p, fmt.Errorf("bad profile name %q (want [a-z0-9][a-z0-9_-]{0,31})", name)
+	}
+	b, err := os.ReadFile(filepath.Join(ProfilesDir(), name+".json"))
+	if err != nil {
+		return p, err
+	}
+	if err := json.Unmarshal(b, &p); err != nil {
+		return p, fmt.Errorf("%s.json: %w", name, err)
+	}
+	return p, nil
+}
 
 // Load reads config.json, filling defaults for anything unset.
 func Load() (Config, error) {

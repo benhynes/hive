@@ -13,6 +13,7 @@ func runSpawn(args []string) error {
 	fs := flags("spawn", args)
 	host := fs.String("host", "", "target host (default: this host)")
 	cwd := fs.String("cwd", "", "working directory for the spawned process")
+	profile := fs.String("profile", "", "spawn profile: context + MCP provisioning (~/.hive/profiles/<name>.json)")
 	grant := fs.Bool("grant-control", false, "inject this host's control token (CONTROL layer)")
 	waitReady := fs.Bool("wait", false, "wait until the pane draws and goes quiet")
 	headed := fs.Bool("headed", false, "open a visible terminal window on the target host attached to the session")
@@ -20,14 +21,16 @@ func runSpawn(args []string) error {
 	fs.Parse2()
 	name := fs.pos(0)
 	cmd := fs.afterDD
-	if name == "" || len(cmd) == 0 {
-		return fmt.Errorf("usage: hive spawn [--host H] [--cwd D] [--grant-control] [--wait] [--headed] [--persist] <name> -- CMD...")
+	// A profile may supply the runtime, so a bare `-- CMD` is optional when
+	// --profile is given; the hub enforces that at least one is present.
+	if name == "" || (len(cmd) == 0 && *profile == "") {
+		return fmt.Errorf("usage: hive spawn [--host H] [--cwd D] [--profile P] [--grant-control] [--wait] [--headed] [--persist] <name> -- CMD...")
 	}
 	c, err := client.Resolve(*fs.net)
 	if err != nil {
 		return err
 	}
-	res, err := c.Spawn(*host, name, cmd, *cwd, *grant, *waitReady, *headed, *persist)
+	res, err := c.Spawn(*host, name, cmd, *cwd, *profile, *grant, *waitReady, *headed, *persist)
 	if err != nil {
 		return err
 	}

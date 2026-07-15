@@ -511,7 +511,7 @@ type SpawnResp struct {
 	Window  string `json:"window,omitempty"`
 }
 
-func (c *Client) Spawn(host, name string, cmd []string, cwd string, grantControl, waitReady, headed, persist bool) (SpawnResp, error) {
+func (c *Client) Spawn(host, name string, cmd []string, cwd, profile string, grantControl, waitReady, headed, persist bool) (SpawnResp, error) {
 	var err error
 	if host == "" {
 		if host, err = c.Self(); err != nil {
@@ -528,7 +528,7 @@ func (c *Client) Spawn(host, name string, cmd []string, cwd string, grantControl
 	}
 	var out SpawnResp
 	err = c.do("POST", base, c.np("/spawn"), tok, map[string]any{
-		"name": name, "cmd": cmd, "cwd": cwd,
+		"name": name, "cmd": cmd, "cwd": cwd, "profile": profile,
 		"grant_control": grantControl, "wait_ready": waitReady, "headed": headed,
 		"persist": persist,
 	}, &out)

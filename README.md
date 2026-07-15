@@ -89,6 +89,36 @@ An agent that is busy elsewhere instead gets a terminal nudge carrying a
 preview of the waiting message. Both paths work; parking in `hive_recv` is the
 one to design worker loops around.
 
+## Spawn profiles — provisioned agents
+
+`hive spawn --cwd DIR` provisions the working directory before the runtime
+starts: it writes a project-scoped `.mcp.json` with the `hive` MCP server
+auto-registered (pointing at the daemon's own binary, so PATH doesn't matter)
+and **pre-approves it in `~/.claude.json`** — both the workspace-trust gate and
+the MCP-server gate — so a headless Claude Code agent boots straight into the
+mesh with no prompt to hang on. A spawn without `--cwd` is unchanged.
+
+A **profile** (`~/.hive/profiles/<name>.json`) extends that with a default
+runtime, cwd, context files seeded into the directory, and extra MCP servers:
+
+```jsonc
+// ~/.hive/profiles/dev.json
+{
+  "runtime": ["claude", "--dangerously-skip-permissions"],
+  "cwd":     "~/work/agents",
+  "context": ["/path/to/AGENT-GUIDE.md"],        // seeded into cwd
+  "mcp": { "playwright": { "command": "npx", "args": ["-y", "@playwright/mcp"] } }
+}
+```
+
+```sh
+hive spawn --profile dev worker            # profile supplies runtime + cwd
+hive spawn --profile dev --cwd ~/x w2 -- claude   # explicit flags win
+```
+
+Explicit flags and a trailing `-- CMD` override profile fields. Set
+`"no_hive_mcp": true` in a profile to opt out of the automatic `hive` server.
+
 ## Add a second host
 
 One command, over ssh:
