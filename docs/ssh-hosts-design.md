@@ -1,7 +1,13 @@
 # Design: SSH hosts — spawn agents onto any SSH-reachable machine
 
-Status: **draft for review, pre-integration.** Branch `ssh-hosts` (worktree),
-off `mcp-agent-interface` (needs `hive mcp`).
+Status: **P1/P2 implemented; P3 lifecycle work remains.** This document is the
+design and implementation record for the SSH managed-session path.
+
+SSH-host spawning deliberately uses tmux on Unix because this feature promises
+remote screen/keys/kill control. Tmux is not required for agent communication:
+an ordinary runtime can enroll through `hive mcp`, or run under `hive run`,
+without adopting a terminal. The architecture below should therefore be read
+as the optional managed-control path, not the mesh's enrollment model.
 
 ## 1. The gap
 
@@ -37,7 +43,7 @@ Two facts make this natural for hive:
 **Validation:** Model A's tunnel routing is proven end-to-end (a `socat`
 proof-of-concept standing in for `ssh -L`/`-R`): a transient daemon reached
 *only* through loopback forwards distinct from its bind handled join, spawn,
-`agents` fan-out, MCP `hive_send`/reply, control `read`, nudge-with-preview,
+`agents` fan-out, MCP `hive_send`/reply, control `read`, fixed terminal nudge,
 and `kill` — the whole existing path, unchanged. The SSH auth/transport layer
 itself was not exercised (it is what `node.go`'s `sshRunner` already ships), and
 none of §7–§9's new work is covered. See §11.
@@ -53,8 +59,8 @@ The SSH host runs a **transient** `hive daemon` bound to its own loopback,
 brought up on demand over SSH (no firewall, no supervisor, no tailnet). The
 origin hub and the remote hub talk to each other through **loopback port
 forwards on the one SSH ControlMaster connection** (`-L` origin→remote,
-`-R` remote→origin). The agent is a normal tmux agent owned by the remote
-daemon; its `HIVE_ADDR` is the remote's own loopback. Control ops flow
+`-R` remote→origin). A managed agent is a normal tmux session owned by the
+remote daemon; its `HIVE_ADDR` is the remote's own loopback. Control ops flow
 origin → (tunnel) → remote hub → local tmux, **exactly as they do between
 tailnet peers today** — no new control substrate.
 
@@ -126,7 +132,9 @@ Stored per-net (see §5). `--profile` names a spawn profile (§4).
    already running. No supervisor, no firewall. Health-check over the tunnel.
    Join it to the net: write the net's msg token (and, if the profile grants
    control, a **host-local** control token) into the remote `net.json` over
-   stdin — never argv.
+   stdin — never argv. Before publishing the connection, require the
+   `explicit_nudge` health feature so an older remote cannot receive a
+   semantically unsafe spawn mutation.
 5. **Ensure tunnels** — on the ControlMaster: `-L <origLoopback>:127.0.0.1:<port>`
    (origin → remote hub) and `-R <remoteLoopback>:127.0.0.1:<originPort>`
    (remote hub → origin hub). Register the reciprocal hosts entries pointing at
@@ -138,9 +146,12 @@ Stored per-net (see §5). `--profile` names a spawn profile (§4).
    binding `127.0.0.1:0` and reading back the assigned port over a fixed range,
    so two origin hubs on one machine don't fight.
 6. **Provision the agent context + MCP** (§4).
-7. **Spawn** — forward a normal spawn request to the remote hub over the `-L`
-   tunnel. The remote daemon mints the agent token, injects `HIVE_*` via tmux
-   `-e`, and (per the profile) the agent's `hive mcp` is already registered.
+7. **Spawn** — forward `/spawn/v2` to the remote hub over the `-L` tunnel. The
+   versioned endpoint is the atomic explicit-nudge compatibility boundary;
+   unversioned `/spawn` is retained only for older clients. The remote daemon
+   mints the agent token and injects `HIVE_*` via tmux `-e`; the provisioned
+   `hive mcp` consumes that injected identity rather than enrolling a second
+   one.
 
 **Latency: run provisioning (6) concurrently with daemon + tunnel bring-up
 (4–5).** They share only the ControlMaster connection (already multiplexed), not
@@ -225,9 +236,10 @@ Provisioning steps, run over SSH before the agent starts:
   feature silently hangs, so it is a functional requirement, not a nicety. This
   is Claude-Code-specific; a non-Claude `runtime` needs its own equivalent (the
   provisioner should treat MCP wiring as per-runtime, see §8.5).
-- **runtime** — the tmux session runs `runtime` (default `claude`); `HIVE_*` are
-  injected by tmux `-e` as today, so the agent is identity-bound and mesh-aware
-  on first prompt.
+- **runtime** — the managed tmux session runs `runtime` (default `claude`);
+  `HIVE_*` are injected by tmux `-e`, so the agent is identity-bound and
+  mesh-aware on first prompt. Runtimes launched outside the managed-control
+  path can instead use lazy MCP enrollment and do not need tmux.
 
 A `--profile` flag selects one; profile fields are overridable by explicit spawn
 flags (`--cwd`, trailing `-- CMD`). No profile = today's behavior plus the `hive`
@@ -397,7 +409,7 @@ forwards distinct from its bind handled, through those forwards:
 - **MCP `hive_send`** origin→remote (via `-L`), received by the agent through its
   own `hive_recv` to its local (remote) hub;
 - **reply** remote→origin routed back via `-R`;
-- **control `read`** via `-L`, and the **nudge-with-preview** reaching the remote
+- **control `read`** via `-L`, and the **fixed nudge notice** reaching the remote
   pane;
 - **kill** through the forward.
 

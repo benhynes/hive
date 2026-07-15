@@ -6,12 +6,19 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/benhynes/hive/internal/client"
 )
 
 // mcpSession is a live `hive mcp` subprocess plus the pipes to talk to it.
@@ -21,11 +28,19 @@ type mcpSession struct {
 	out *bufio.Scanner
 	cmd *exec.Cmd
 	id  int
+
+	waitOnce sync.Once
+	waitDone chan struct{}
+	waitErr  error
 }
 
 func startMCP(t *testing.T, env []string) *mcpSession {
+	return startMCPArgs(t, env)
+}
+
+func startMCPArgs(t *testing.T, env []string, args ...string) *mcpSession {
 	t.Helper()
-	cmd := exec.Command(hiveBin(t), "mcp")
+	cmd := exec.Command(hiveBin(t), append([]string{"mcp"}, args...)...)
 	cmd.Env = env
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -38,14 +53,16 @@ func startMCP(t *testing.T, env []string) *mcpSession {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		stdin.Close()
-		cmd.Process.Kill()
-		cmd.Wait()
-	})
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	s := &mcpSession{t: t, in: stdin, out: sc, cmd: cmd}
+	s := &mcpSession{t: t, in: stdin, out: sc, cmd: cmd, waitDone: make(chan struct{})}
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		if _, ok := s.wait(3 * time.Second); !ok {
+			_ = cmd.Process.Kill()
+			_, _ = s.wait(3 * time.Second)
+		}
+	})
 
 	// Every MCP session opens with the handshake.
 	res := s.rpc("initialize", map[string]any{
@@ -58,6 +75,21 @@ func startMCP(t *testing.T, env []string) *mcpSession {
 	}
 	s.notify("notifications/initialized")
 	return s
+}
+
+func (s *mcpSession) wait(timeout time.Duration) (error, bool) {
+	s.waitOnce.Do(func() {
+		go func() {
+			s.waitErr = s.cmd.Wait()
+			close(s.waitDone)
+		}()
+	})
+	select {
+	case <-s.waitDone:
+		return s.waitErr, true
+	case <-time.After(timeout):
+		return nil, false
+	}
 }
 
 // rpc sends a request and returns its result, failing on a JSON-RPC error.
@@ -156,6 +188,58 @@ func hasTool(names []string, want string) bool {
 	return false
 }
 
+func TestInjectedMCPIdentityIgnoresConfiguredName(t *testing.T) {
+	c := &client.Client{Agent: "injected@host"}
+	if err := validateMCPName(c, "Not/A/Valid/Hive/Name"); err != nil {
+		t.Fatalf("injected identity was overridden by configured name validation: %v", err)
+	}
+	if err := validateMCPName(&client.Client{}, "Not/A/Valid/Hive/Name"); err == nil {
+		t.Fatal("automatic registration accepted an invalid configured name")
+	}
+}
+
+func TestMCPInitializesWhileEnrollmentIsDeferred(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and drives the MCP subprocess")
+	}
+	// Nothing is listening on this freshly released port. Initialization and
+	// tool discovery must still work: enrollment is a recoverable tool-time
+	// dependency, not a prerequisite for the MCP protocol handshake.
+	addr := fmt.Sprintf("http://127.0.0.1:%d", freePort(t))
+	env := append(os.Environ(),
+		"HIVE_HOME="+t.TempDir(), "HIVE_ADDR="+addr, "HIVE_NET=dev",
+		"HIVE_TOKEN="+strings.Repeat("a", 64), "HIVE_AGENT=",
+		"HIVE_CONTROL_TOKEN=", "HIVE_CONTROL_HOST=", "TMUX_PANE=",
+	)
+	s := startMCPArgs(t, env, "--name", "waiting")
+	if names := s.tools(); !hasTool(names, "hive_agents") || !hasTool(names, "hive_send") {
+		t.Fatalf("deferred MCP session did not advertise message tools: %v", names)
+	}
+	if err := s.in.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err, ok := s.wait(5 * time.Second); !ok || err != nil {
+		t.Fatalf("deferred MCP shutdown: ok=%v err=%v", ok, err)
+	}
+}
+
+func requireMCPAgentState(t *testing.T, raw, agent string, wantAlive, wantEphemeral bool) {
+	t.Helper()
+	var roster client.AgentsResp
+	if err := json.Unmarshal([]byte(raw), &roster); err != nil {
+		t.Fatalf("decode agents: %v\n%s", err, raw)
+	}
+	for _, got := range roster.Agents {
+		if got.Agent == agent {
+			if got.Alive != wantAlive || got.Ephemeral != wantEphemeral {
+				t.Fatalf("agent %s state=%+v, want alive=%v ephemeral=%v", agent, got, wantAlive, wantEphemeral)
+			}
+			return
+		}
+	}
+	t.Fatalf("agent %s missing from roster: %s", agent, raw)
+}
+
 func TestMCPEndToEnd(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e: daemon + mcp subprocesses")
@@ -178,6 +262,77 @@ func TestMCPEndToEnd(t *testing.T) {
 	bobEnv := register(t, h, "bob")
 	alice := startMCP(t, aliceEnv)
 	bob := startMCP(t, bobEnv)
+	// No pre-registration and no injected identity: this is the one-time global
+	// MCP configuration path used by an agent launched normally, outside tmux.
+	auto := startMCPArgs(t, h.env(
+		"HIVE_ADDR=", "HIVE_NET=", "HIVE_AGENT=", "HIVE_TOKEN=",
+		"HIVE_CONTROL_TOKEN=", "HIVE_CONTROL_HOST=",
+	), "--name", "autobot")
+
+	t.Run("mcp-auto-registers-with-msg-only-identity", func(t *testing.T) {
+		names := auto.tools()
+		if !hasTool(names, "hive_send") || !hasTool(names, "hive_recv") {
+			t.Fatalf("auto-registered agent missing message tools: %v", names)
+		}
+		for _, never := range []string{"hive_spawn", "hive_keys", "hive_read", "hive_kill"} {
+			if hasTool(names, never) {
+				t.Errorf("auto-registered agent inherited on-disk control tool %s", never)
+			}
+		}
+		directory := auto.mustCall("hive_agents", map[string]any{})
+		var ownDirectory struct {
+			Self   string `json:"self"`
+			Agents []any  `json:"agents"`
+		}
+		if err := json.Unmarshal([]byte(directory), &ownDirectory); err != nil {
+			t.Fatalf("auto agent directory is not JSON: %v\n%s", err, directory)
+		}
+		if ownDirectory.Self != "autobot@mcphost" {
+			t.Fatalf("auto agent directory self = %q, want autobot@mcphost\n%s", ownDirectory.Self, directory)
+		}
+		if len(ownDirectory.Agents) == 0 {
+			t.Fatalf("adding self dropped the agents roster:\n%s", directory)
+		}
+		listed := alice.mustCall("hive_agents", map[string]any{})
+		if !strings.Contains(listed, "autobot@mcphost") {
+			t.Fatalf("auto-registered agent was not discoverable:\n%s", listed)
+		}
+		alice.mustCall("hive_send", map[string]any{"to": "autobot", "body": "hello without tmux"})
+		got := auto.mustCall("hive_recv", map[string]any{})
+		if !strings.Contains(got, "hello without tmux") || !strings.Contains(got, "alice@mcphost") {
+			t.Fatalf("auto-registered agent did not receive mail:\n%s", got)
+		}
+	})
+
+	t.Run("name-collision-does-not-block-handshake-and-recovers", func(t *testing.T) {
+		env := h.env(
+			"HIVE_HOME="+t.TempDir(), "HIVE_ADDR="+h.url(), "HIVE_NET=dev",
+			"HIVE_AGENT=", "HIVE_TOKEN="+h.msgTok,
+			"HIVE_CONTROL_TOKEN=", "HIVE_CONTROL_HOST=",
+		)
+		owner := startMCPArgs(t, env, "--name", "retry-agent")
+		owner.mustCall("hive_agents", map[string]any{}) // force enrollment
+
+		waiting := startMCPArgs(t, env, "--name", "retry-agent")
+		if names := waiting.tools(); !hasTool(names, "hive_agents") {
+			t.Fatalf("colliding session failed MCP discovery: %v", names)
+		}
+		if err := owner.in.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err, ok := owner.wait(5 * time.Second); !ok || err != nil {
+			t.Fatalf("release colliding owner: ok=%v err=%v", ok, err)
+		}
+		var directory struct {
+			Self string `json:"self"`
+		}
+		if err := json.Unmarshal([]byte(waiting.mustCall("hive_agents", map[string]any{})), &directory); err != nil {
+			t.Fatal(err)
+		}
+		if directory.Self != "retry-agent@mcphost" {
+			t.Fatalf("re-enrolled self = %q", directory.Self)
+		}
+	})
 
 	t.Run("msg-agent-sees-only-msg-tools", func(t *testing.T) {
 		names := alice.tools()
@@ -287,6 +442,79 @@ func TestMCPEndToEnd(t *testing.T) {
 			}
 		case <-time.After(30 * time.Second):
 			t.Fatal("hive_ask never returned after the answer was sent")
+		}
+	})
+
+	t.Run("named-auto-identity-goes-offline-on-stdio-eof", func(t *testing.T) {
+		if err := auto.in.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err, ok := auto.wait(5 * time.Second); !ok {
+			t.Fatal("hive mcp did not exit after stdin EOF")
+		} else if err != nil {
+			t.Fatalf("hive mcp EOF exit: %v", err)
+		}
+		agents := mustCLI(t, h.env(), "agents", "--local", "--json")
+		requireMCPAgentState(t, agents, "autobot@mcphost", false, false)
+	})
+
+	t.Run("sigterm-unblocks-stdio-and-releases-named-identity", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Windows does not provide Unix SIGTERM semantics")
+		}
+		s := startMCPArgs(t, h.env(
+			"HIVE_HOME="+t.TempDir(), "HIVE_ADDR="+h.url(), "HIVE_NET=dev",
+			"HIVE_AGENT=", "HIVE_TOKEN="+h.msgTok,
+			"HIVE_CONTROL_TOKEN=", "HIVE_CONTROL_HOST=",
+		), "--name", "term-agent")
+		s.mustCall("hive_agents", map[string]any{}) // make enrollment deterministic before shutdown
+		if err := s.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			t.Fatal(err)
+		}
+		if err, ok := s.wait(5 * time.Second); !ok {
+			t.Fatal("hive mcp stayed blocked in stdin after SIGTERM")
+		} else if err != nil {
+			t.Fatalf("hive mcp SIGTERM exit: %v", err)
+		}
+		agents := mustCLI(t, h.env(), "agents", "--local", "--json")
+		requireMCPAgentState(t, agents, "term-agent@mcphost", false, false)
+	})
+
+	t.Run("generated-auto-identity-is-disposable", func(t *testing.T) {
+		s := startMCPArgs(t, h.env(
+			"HIVE_HOME="+t.TempDir(), "HIVE_ADDR="+h.url(), "HIVE_NET=dev",
+			"HIVE_AGENT=", "HIVE_TOKEN="+h.msgTok,
+			"HIVE_CONTROL_TOKEN=", "HIVE_CONTROL_HOST=",
+		))
+		var directory struct {
+			Self string `json:"self"`
+		}
+		if err := json.Unmarshal([]byte(s.mustCall("hive_agents", map[string]any{})), &directory); err != nil {
+			t.Fatal(err)
+		}
+		if directory.Self == "" {
+			t.Fatal("generated MCP identity did not report self")
+		}
+		oldSelf := directory.Self
+		mustCLI(t, h.env(), "deregister", oldSelf)
+		// Losing the record entirely (for example, after the crash-recovery
+		// grace period) must not permanently poison a long-lived MCP session.
+		// A 401 causes the gate to restore its bootstrap credential and mint a
+		// fresh disposable identity before retrying the read-only tool call.
+		if err := json.Unmarshal([]byte(s.mustCall("hive_agents", map[string]any{})), &directory); err != nil {
+			t.Fatal(err)
+		}
+		if directory.Self == "" || directory.Self == oldSelf {
+			t.Fatalf("generated identity did not recover after record loss: old=%q new=%q", oldSelf, directory.Self)
+		}
+		if err := s.in.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err, ok := s.wait(5 * time.Second); !ok || err != nil {
+			t.Fatalf("generated MCP shutdown: ok=%v err=%v", ok, err)
+		}
+		if agents := mustCLI(t, h.env(), "agents", "--local", "--json"); strings.Contains(agents, directory.Self) {
+			t.Fatalf("generated identity remained after EOF: %s", agents)
 		}
 	})
 }

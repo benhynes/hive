@@ -5,8 +5,10 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/benhynes/hive/internal/config"
+	"github.com/benhynes/hive/internal/store"
 )
 
 // hMetrics exposes aggregate, read-only transport health. It deliberately
@@ -40,8 +42,12 @@ func (h *Hub) hMetrics(w http.ResponseWriter, _ *http.Request) {
 		aliveCount, deadCount, controllable, persistentReady, inboxLag := 0, 0, 0, 0, int64(0)
 		livePane := make(map[string]bool)
 		scrapeError := false
+		observedAt := time.Now()
 		for _, rec := range n.reg.List() {
-			isAlive := alive(rec)
+			if !discoverableAt(rec, observedAt) {
+				continue
+			}
+			isAlive := aliveAt(rec, observedAt)
 			if isAlive {
 				aliveCount++
 			} else {
@@ -51,9 +57,16 @@ func (h *Hub) hMetrics(w http.ResponseWriter, _ *http.Request) {
 				controllable++
 				livePane[rec.Name] = true
 			}
-			if ib, err := n.inbox(rec.Name); err == nil {
+			n.regMu.Lock()
+			current, currentOK := n.reg.Get(rec.Name)
+			var ib *store.Inbox
+			if currentOK && current.TokenHash == rec.TokenHash {
+				ib, err = n.inbox(rec.Name)
+			}
+			n.regMu.Unlock()
+			if err == nil && ib != nil {
 				inboxLag += ib.Lag()
-			} else {
+			} else if err != nil {
 				scrapeError = true
 			}
 		}

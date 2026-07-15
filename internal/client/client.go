@@ -10,7 +10,9 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -25,6 +27,32 @@ import (
 	"github.com/benhynes/hive/internal/proto"
 )
 
+// HTTPError preserves the response status for callers that need to
+// distinguish an expired credential from a transient transport failure. Its
+// Error text remains the daemon's human-readable message for CLI callers.
+type HTTPError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *HTTPError) Error() string { return e.Message }
+
+// IsHTTPStatus reports whether err is a daemon response with one of statuses.
+// Wrapped errors are supported so higher-level lifecycle code can recover a
+// lost managed identity without parsing error strings.
+func IsHTTPStatus(err error, statuses ...int) bool {
+	var responseErr *HTTPError
+	if !errors.As(err, &responseErr) {
+		return false
+	}
+	for _, status := range statuses {
+		if responseErr.StatusCode == status {
+			return true
+		}
+	}
+	return false
+}
+
 type Client struct {
 	Addr    string // local hub base, e.g. http://127.0.0.1:7777
 	Net     string
@@ -36,15 +64,38 @@ type Client struct {
 	Agent       string // our own id (name@host) if known
 	hc          *http.Client
 
-	mu    sync.RWMutex      // guards self + hosts (concurrent MCP tool calls read them)
+	mu    sync.RWMutex      // guards self, hosts, and ctx (MCP tools are concurrent)
 	self  string            // local hub's host name (lazy)
 	hosts map[string]string // local hub's hosts list (lazy)
+	ctx   context.Context   // request lifetime; background when unset
 }
 
 // SetHTTPTimeout overrides the request timeout. A caller that polls many
 // hosts can set a short one so a black-holed host can't stall a loop.
 // Not safe to call concurrently with in-flight requests.
 func (c *Client) SetHTTPTimeout(d time.Duration) { c.hc.Timeout = d }
+
+// SetContext replaces the lifetime inherited by subsequent HTTP requests.
+// Managed runtimes use it to cancel outstanding long polls and asks when the
+// owning stdio session or child process disappears.
+func (c *Client) SetContext(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.mu.Lock()
+	c.ctx = ctx
+	c.mu.Unlock()
+}
+
+func (c *Client) requestContext() context.Context {
+	c.mu.RLock()
+	ctx := c.ctx
+	c.mu.RUnlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
 
 // Resolve builds a client from env, flags, and local config.
 func Resolve(netFlag string) (*Client, error) {
@@ -57,6 +108,7 @@ func Resolve(netFlag string) (*Client, error) {
 		Net:   netFlag,
 		Agent: os.Getenv("HIVE_AGENT"),
 		hc:    &http.Client{Timeout: 35 * time.Second},
+		ctx:   context.Background(),
 	}
 	if c.Addr == "" {
 		// Mirror hSpawn's HIVE_ADDR logic: a daemon bound to a specific
@@ -152,6 +204,10 @@ func (c *Client) localControlToken() (string, error) {
 }
 
 func (c *Client) do(method, base, path, token string, in, out any) error {
+	return c.doContext(c.requestContext(), method, base, path, token, in, out)
+}
+
+func (c *Client) doContext(ctx context.Context, method, base, path, token string, in, out any) error {
 	var rd io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
@@ -160,7 +216,10 @@ func (c *Client) do(method, base, path, token string, in, out any) error {
 		}
 		rd = strings.NewReader(string(b))
 	}
-	req, err := http.NewRequest(method, base+path, rd)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, base+path, rd)
 	if err != nil {
 		return err
 	}
@@ -184,12 +243,37 @@ func (c *Client) do(method, base, path, token string, in, out any) error {
 		if e.Error == "" {
 			e.Error = resp.Status
 		}
-		return fmt.Errorf("%s", e.Error)
+		return &HTTPError{StatusCode: resp.StatusCode, Message: e.Error}
 	}
 	if out != nil {
 		return json.NewDecoder(resp.Body).Decode(out)
 	}
 	return nil
+}
+
+const featureExplicitNudge = "explicit_nudge"
+
+type HealthResp struct {
+	API      string   `json:"api"`
+	Version  int      `json:"v"`
+	Host     string   `json:"host"`
+	Features []string `json:"features,omitempty"`
+}
+
+// requireFeature is a read-only compatibility preflight for operations whose
+// legacy interpretation is unsafe. In particular, an old daemon must never
+// create a pane before the client discovers that terminal nudging was implicit.
+func (c *Client) requireFeature(base, feature string) error {
+	var health HealthResp
+	if err := c.do("GET", base, "/v1/health", c.Token, nil, &health); err != nil {
+		return fmt.Errorf("check daemon compatibility: %w", err)
+	}
+	for _, advertised := range health.Features {
+		if advertised == feature {
+			return nil
+		}
+	}
+	return fmt.Errorf("daemon does not advertise %q; upgrade/restart hive before pane control", feature)
 }
 
 func (c *Client) np(rest string) string { return "/v1/nets/" + c.Net + rest }
@@ -304,11 +388,16 @@ type AgentInfo struct {
 	Agent        string `json:"agent"`
 	Alive        bool   `json:"alive"`
 	Controllable bool   `json:"controllable"`
+	Nudgeable    bool   `json:"nudgeable"`
+	Ephemeral    bool   `json:"ephemeral,omitempty"`
 	Spawned      bool   `json:"spawned,omitempty"`
 	Registered   int64  `json:"registered"`
+	LastSeen     int64  `json:"last_seen,omitempty"`
+	LeaseExpires int64  `json:"lease_expires,omitempty"`
 }
 
 type AgentsResp struct {
+	Self        string            `json:"self,omitempty"`
 	Agents      []AgentInfo       `json:"agents"`
 	Unreachable map[string]string `json:"unreachable,omitempty"`
 }
@@ -325,15 +414,148 @@ func (c *Client) Agents(localOnly bool) (AgentsResp, error) {
 
 // ---- registration ----
 
+const (
+	// DefaultLeaseSeconds leaves room for two missed heartbeats before an
+	// otherwise-unbound agent is shown offline and its name can be reclaimed.
+	DefaultLeaseSeconds = 60
+	// DefaultHeartbeatSeconds is the cadence used by managed clients.
+	DefaultHeartbeatSeconds = 15
+)
+
 type RegisterResp struct {
-	Agent string `json:"agent"`
-	Token string `json:"token"`
+	Agent        string `json:"agent"`
+	Token        string `json:"token"`
+	Nudge        bool   `json:"nudge,omitempty"`
+	NudgePolicy  string `json:"nudge_policy"`
+	LeaseSeconds int    `json:"lease_seconds,omitempty"`
+	LeaseExpires int64  `json:"lease_expires,omitempty"`
+	Ephemeral    bool   `json:"ephemeral,omitempty"`
 }
 
+// Register preserves the original, unleased registration behavior. Managed
+// clients should prefer RegisterLease and heartbeat while they are running.
 func (c *Client) Register(name, pane string, pid int) (RegisterResp, error) {
+	return c.RegisterWithNudge(name, pane, pid, false)
+}
+
+// RegisterWithNudge preserves Register's unleased behavior and explicitly
+// controls whether mail may trigger a fixed terminal wake notice. Nudge may
+// only be enabled for a pane-bound registration.
+func (c *Client) RegisterWithNudge(name, pane string, pid int, nudge bool) (RegisterResp, error) {
+	return c.RegisterLeaseWithNudge(name, pane, pid, 0, nudge)
+}
+
+// RegisterLease registers an agent with renewable presence. leaseSeconds=0
+// deliberately requests the legacy behavior used by Register.
+func (c *Client) RegisterLease(name, pane string, pid, leaseSeconds int) (RegisterResp, error) {
+	return c.RegisterLeaseWithNudge(name, pane, pid, leaseSeconds, false)
+}
+
+// RegisterLeaseWithNudge is RegisterLease with explicit terminal-wake
+// consent. Message delivery itself never requires a pane or nudge opt-in.
+func (c *Client) RegisterLeaseWithNudge(name, pane string, pid, leaseSeconds int, nudge bool) (RegisterResp, error) {
+	return c.registerLease(name, pane, pid, leaseSeconds, false, nudge)
+}
+
+// RegisterEphemeralLease registers a generated, message-only identity whose
+// registry record may be removed after its lease expires. Explicitly named
+// identities should use RegisterLease so they remain resumable while offline.
+func (c *Client) RegisterEphemeralLease(name string, leaseSeconds int) (RegisterResp, error) {
+	if leaseSeconds <= 0 {
+		return RegisterResp{}, fmt.Errorf("ephemeral registration requires a positive lease")
+	}
+	return c.registerLease(name, "", 0, leaseSeconds, true, false)
+}
+
+func (c *Client) registerLease(name, pane string, pid, leaseSeconds int, ephemeral, nudge bool) (RegisterResp, error) {
 	var out RegisterResp
-	err := c.do("POST", c.Addr, c.np("/register"), c.Token,
-		map[string]any{"name": name, "pane": pane, "pid": pid}, &out)
+	if nudge && pane == "" {
+		return out, fmt.Errorf("nudge requires an explicitly bound pane")
+	}
+	tok := c.Token
+	if pane != "" {
+		var err error
+		tok, err = c.localControlToken()
+		if err != nil {
+			return out, err
+		}
+		if err := c.requireFeature(c.Addr, featureExplicitNudge); err != nil {
+			return out, err
+		}
+	}
+	payload := map[string]any{
+		"name": name, "pane": pane, "pid": pid, "lease_seconds": leaseSeconds,
+		"nudge": nudge,
+	}
+	if ephemeral {
+		payload["ephemeral"] = true
+	}
+	registerPath := "/register"
+	if pane != "" {
+		registerPath = "/register/v2"
+	}
+	err := c.do("POST", c.Addr, c.np(registerPath), tok, payload, &out)
+	if err != nil {
+		return out, err
+	}
+	if pane != "" && (out.NudgePolicy != "explicit" || out.Nudge != nudge) {
+		cleanupErr := c.do("POST", c.Addr, c.np("/deregister"), out.Token,
+			map[string]string{"name": ""}, nil)
+		if cleanupErr != nil {
+			return RegisterResp{}, fmt.Errorf("daemon advertised explicit terminal nudging but did not honor the requested policy; cleanup failed: %v", cleanupErr)
+		}
+		return RegisterResp{}, fmt.Errorf("daemon advertised explicit terminal nudging but did not honor the requested policy")
+	}
+	if leaseSeconds <= 0 {
+		return out, nil
+	}
+	if out.LeaseSeconds == leaseSeconds && out.LeaseExpires > 0 && (!ephemeral || out.Ephemeral) {
+		return out, nil
+	}
+	// Older daemons may ignore lease_seconds or the newer ephemeral marker. Do
+	// not silently leave an unbound, permanently-live record behind: revoke the
+	// just-minted credential before reporting that the daemon must be upgraded
+	// or restarted. Cleanup is best-effort because the compatibility error is
+	// the actionable result either way.
+	cleanupErr := c.do("POST", c.Addr, c.np("/deregister"), out.Token,
+		map[string]string{"name": ""}, nil)
+	feature := "presence lease"
+	if ephemeral && out.LeaseSeconds == leaseSeconds && out.LeaseExpires > 0 && !out.Ephemeral {
+		feature = "ephemeral registration"
+	}
+	if cleanupErr != nil {
+		return RegisterResp{}, fmt.Errorf("daemon did not honor the requested %s (upgrade/restart hive); cleanup failed: %v", feature, cleanupErr)
+	}
+	return RegisterResp{}, fmt.Errorf("daemon did not honor the requested %s; upgrade/restart hive", feature)
+}
+
+type HeartbeatResp struct {
+	Agent        string `json:"agent"`
+	LeaseSeconds int    `json:"lease_seconds,omitempty"`
+	LeaseExpires int64  `json:"lease_expires,omitempty"`
+}
+
+// Heartbeat renews the caller's own presence lease. The hub also accepts it
+// for legacy registrations as a no-op, which makes lifecycle code safe during
+// rolling upgrades.
+func (c *Client) Heartbeat() (HeartbeatResp, error) {
+	return c.HeartbeatContext(c.requestContext())
+}
+
+// HeartbeatContext permits lifecycle loops to use a deadline substantially
+// shorter than the presence lease, so a black-holed hub cannot consume the
+// entire renewal window or delay shutdown.
+func (c *Client) HeartbeatContext(ctx context.Context) (HeartbeatResp, error) {
+	var out HeartbeatResp
+	err := c.doContext(ctx, "POST", c.Addr, c.np("/heartbeat"), c.Token, nil, &out)
+	return out, err
+}
+
+// ReleaseLease marks a stable managed identity offline immediately while
+// retaining its address and mailbox for durable delivery between runs.
+func (c *Client) ReleaseLease() (HeartbeatResp, error) {
+	var out HeartbeatResp
+	err := c.do("POST", c.Addr, c.np("/release"), c.Token, nil, &out)
 	return out, err
 }
 
@@ -504,14 +726,22 @@ func (c *Client) Answer(askID, body string) (SendResp, error) {
 // ---- control (direct to the target host's hub) ----
 
 type SpawnResp struct {
-	Agent   string `json:"agent"`
-	Session string `json:"session"`
-	Pane    string `json:"pane"`
-	Ready   bool   `json:"ready"`
-	Window  string `json:"window,omitempty"`
+	Agent       string `json:"agent"`
+	Session     string `json:"session"`
+	Pane        string `json:"pane"`
+	Nudge       bool   `json:"nudge,omitempty"`
+	NudgePolicy string `json:"nudge_policy"`
+	Ready       bool   `json:"ready"`
+	Window      string `json:"window,omitempty"`
 }
 
 func (c *Client) Spawn(host, name string, cmd []string, cwd, profile string, grantControl, waitReady, headed, persist bool) (SpawnResp, error) {
+	return c.SpawnWithNudge(host, name, cmd, cwd, profile, grantControl, waitReady, headed, false, persist)
+}
+
+// SpawnWithNudge is Spawn with explicit consent for the hub to submit fixed
+// terminal wake notices when mail arrives and the child is idle.
+func (c *Client) SpawnWithNudge(host, name string, cmd []string, cwd, profile string, grantControl, waitReady, headed, nudge, persist bool) (SpawnResp, error) {
 	var err error
 	// An SSH host isn't a daemon peer: the local hub owns its bring-up, so route
 	// the spawn to the local hub with ssh_host set and let it forward.
@@ -532,12 +762,18 @@ func (c *Client) Spawn(host, name string, cmd []string, cwd, profile string, gra
 	if err != nil {
 		return SpawnResp{}, err
 	}
+	if err := c.requireFeature(base, featureExplicitNudge); err != nil {
+		return SpawnResp{}, err
+	}
 	var out SpawnResp
-	err = c.do("POST", base, c.np("/spawn"), tok, map[string]any{
+	err = c.do("POST", base, c.np("/spawn/v2"), tok, map[string]any{
 		"name": name, "cmd": cmd, "cwd": cwd, "profile": profile, "ssh_host": sshHost,
 		"grant_control": grantControl, "wait_ready": waitReady, "headed": headed,
-		"persist": persist,
+		"nudge": nudge, "persist": persist,
 	}, &out)
+	if err == nil && (out.NudgePolicy != "explicit" || out.Nudge != nudge) {
+		return SpawnResp{}, fmt.Errorf("daemon advertised explicit terminal nudging but did not honor the requested policy")
+	}
 	return out, err
 }
 

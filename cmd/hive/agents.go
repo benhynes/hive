@@ -31,10 +31,14 @@ func runAgents(args []string) error {
 		fmt.Println("(no agents registered)")
 	} else {
 		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "AGENT\tALIVE\tCONTROLLABLE\tSPAWNED\tREGISTERED")
+		fmt.Fprintln(w, "AGENT\tALIVE\tMAILBOX\tCONTROLLABLE\tNUDGE\tSPAWNED\tREGISTERED")
 		for _, a := range res.Agents {
-			fmt.Fprintf(w, "%s\t%v\t%v\t%v\t%s ago\n",
-				a.Agent, a.Alive, a.Controllable, a.Spawned, ago(a.Registered))
+			mailbox := "retained"
+			if a.Ephemeral {
+				mailbox = "disposable"
+			}
+			fmt.Fprintf(w, "%s\t%v\t%s\t%v\t%v\t%v\t%s ago\n",
+				a.Agent, a.Alive, mailbox, a.Controllable, a.Nudgeable, a.Spawned, ago(a.Registered))
 		}
 		w.Flush()
 	}

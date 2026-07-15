@@ -269,7 +269,6 @@ func nodeInstallWindows(ssh sshx.Runner, cfg config.Config, netName string, nc c
 
 	fmt.Printf("\nnode %q is in the mesh:\n", o.name)
 	fmt.Printf("  hive agents                        # should reach @%s\n", o.name)
-	fmt.Printf("  hive send <agent>@%s ...\n", o.name)
 	if o.controlMode == nodeControlShared {
 		fmt.Printf("  hive spawn --host %s <name> -- CMD...\n", o.name)
 	} else if o.controlMode == nodeControlLocal {

@@ -12,10 +12,10 @@ import (
 // Available verifies the platform control mechanism is usable.
 func Available() error { return tmux.Available() }
 
-// AllowClientPane reports whether a client may self-register the given
-// pane id. tmux pane ids (%N) are only valid for sessions this server
-// owns, so a client cannot forge one pointing at an unrelated process —
-// PaneExists rejects anything tmux did not create. Always permitted.
+// AllowClientPane performs platform-specific validation of a client-supplied
+// pane. On Unix the hub's tmux server validates the target later in PanePID;
+// authorization is deliberately enforced by the register handler before this
+// point, because a tmux pane may belong to a session Hive did not spawn.
 func AllowClientPane(pane string) error { return nil }
 
 // NewSession starts a detached session running cmd with env injected and

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 )
 
 // protocolVersions are the MCP revisions this server speaks, newest first.
@@ -14,6 +15,12 @@ import (
 // newest — which is what the spec asks a server to do on a version it does
 // not recognize.
 var protocolVersions = []string{"2025-06-18", "2025-03-26", "2024-11-05"}
+
+// A transport peer can stop draining stdout while a response is being
+// encoded. Context cannot interrupt an arbitrary io.Writer, so shutdown gives
+// handlers a brief grace period and then lets the owning process exit rather
+// than keeping its identity leased forever.
+const handlerShutdownGrace = time.Second
 
 // Tool is one callable exposed to the agent. Schema is the raw JSON Schema
 // for the arguments object. Control marks a tool that needs the CONTROL
@@ -144,6 +151,8 @@ func toolResult(text string, isErr bool) map[string]any {
 // exhausted. Responses are written to w. Only Handle is protocol; this is
 // only framing.
 func (s *Server) ServeStdio(ctx context.Context, r io.Reader, w io.Writer) error {
+	serveCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	sc := bufio.NewScanner(r)
 	// Envelopes carry message bodies (8 KiB cap) plus schema overhead; a
 	// 1 MiB line ceiling clears that with room to spare.
@@ -163,28 +172,82 @@ func (s *Server) ServeStdio(ctx context.Context, r io.Reader, w io.Writer) error
 	// ids let responses come back out of order, which is exactly what this
 	// needs.
 	var wg sync.WaitGroup
-	defer wg.Wait()
 
-	for sc.Scan() {
-		line := sc.Bytes()
+	// Scanner reads are not context-aware, and closing an *os.File from a
+	// different goroutine does not reliably interrupt a blocked pipe read on
+	// every platform. Keep framing in a reader goroutine and let the serving
+	// loop leave immediately on cancellation; a blocked reader cannot keep the
+	// process alive once ServeStdio returns.
+	lines := make(chan []byte)
+	scanDone := make(chan error, 1)
+	go func() {
+		defer close(lines)
+		for sc.Scan() {
+			line := append([]byte(nil), sc.Bytes()...)
+			select {
+			case lines <- line:
+			case <-serveCtx.Done():
+				scanDone <- nil
+				return
+			}
+		}
+		scanDone <- sc.Err()
+	}()
+
+	var scanErr error
+serve:
+	for {
+		var line []byte
+		select {
+		case <-ctx.Done():
+			break serve
+		case varLine, ok := <-lines:
+			if !ok {
+				scanErr = <-scanDone
+				break serve
+			}
+			line = varLine
+		}
 		if len(line) == 0 {
 			continue
 		}
 		var req Request
 		if err := json.Unmarshal(line, &req); err != nil {
-			write(fail(nil, errParse, "parse error: "+err.Error()))
+			// Keep even protocol-error writes off the framing goroutine. A peer
+			// that stops draining stdout must not make cancellation/EOF hang here.
+			wg.Add(1)
+			go func(resp *Response) {
+				defer wg.Done()
+				write(resp)
+			}(fail(nil, errParse, "parse error: "+err.Error()))
 			continue
 		}
 		wg.Add(1)
 		go func(req Request) {
 			defer wg.Done()
-			if resp := s.Handle(ctx, &req); resp != nil {
+			if resp := s.Handle(serveCtx, &req); resp != nil {
 				write(resp)
 			}
 		}(req)
 	}
-	if err := sc.Err(); err != nil {
-		return fmt.Errorf("read stdin: %w", err)
+	// EOF is the transport lifetime boundary. Cancel every in-flight tool
+	// before joining it so a blocking ask cannot keep a disconnected MCP
+	// sidecar alive. Callers should likewise bind their HTTP client to ctx.
+	cancel()
+	handlersDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(handlersDone)
+	}()
+	select {
+	case <-handlersDone:
+	case <-time.After(handlerShutdownGrace):
+		// A handler is stuck outside context-aware work (most commonly in the
+		// output writer). It is safe for the stdio owner to abandon it: the
+		// transport is already closed/cancelled and no response can be useful.
+	}
+	if scanErr != nil && ctx.Err() == nil {
+		return fmt.Errorf("read stdin: %w", scanErr)
 	}
 	return nil
 }

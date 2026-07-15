@@ -19,8 +19,13 @@ import (
 	"github.com/benhynes/hive/internal/store"
 )
 
-// maxWait caps long-poll hold time per request.
-const maxWait = 25 * time.Second
+const (
+	// maxWait caps long-poll hold time per request.
+	maxWait = 25 * time.Second
+	// maxLeaseSeconds prevents an accidental effectively-permanent lease.
+	// Zero remains meaningful: it requests the legacy, unleased behavior.
+	maxLeaseSeconds = 60 * 60
+)
 
 type errResp struct {
 	Error string `json:"error"`
@@ -95,10 +100,21 @@ func (h *Hub) withNet(level int, fn netHandler) http.HandlerFunc {
 func (h *Hub) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"api": "hive", "v": 1, "host": h.Cfg.HostName})
+		writeJSON(w, 200, map[string]any{
+			"api": "hive", "v": 1, "host": h.Cfg.HostName,
+			"features": []string{
+				"leases", "ephemeral_registration", "release_presence",
+				"explicit_nudge", "versioned_pane_mutations",
+			},
+		})
 	})
 	mux.HandleFunc("GET /metrics", h.hMetrics)
 	mux.HandleFunc("POST /v1/nets/{net}/register", h.withNet(accNetTok, h.hRegister))
+	// Versioned pane mutation paths are an atomic compatibility boundary: an
+	// older implicitly-nudging daemon returns 404 instead of creating a pane.
+	mux.HandleFunc("POST /v1/nets/{net}/register/v2", h.withNet(accNetTok, h.hRegister))
+	mux.HandleFunc("POST /v1/nets/{net}/heartbeat", h.withNet(accAny, h.hHeartbeat))
+	mux.HandleFunc("POST /v1/nets/{net}/release", h.withNet(accAny, h.hRelease))
 	mux.HandleFunc("POST /v1/nets/{net}/deregister", h.withNet(accAny, h.hDeregister))
 	mux.HandleFunc("GET /v1/nets/{net}/agents", h.withNet(accAny, h.hAgents))
 	mux.HandleFunc("POST /v1/nets/{net}/send", h.withNet(accAny, h.hSend))
@@ -109,6 +125,7 @@ func (h *Hub) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/nets/{net}/hosts", h.withNet(accControl, h.hHostsPost))
 	mux.HandleFunc("POST /v1/nets/{net}/control/rotate", h.withNet(accControl, h.hRotateControl))
 	mux.HandleFunc("POST /v1/nets/{net}/spawn", h.withNet(accControl, h.hSpawn))
+	mux.HandleFunc("POST /v1/nets/{net}/spawn/v2", h.withNet(accControl, h.hSpawn))
 	mux.HandleFunc("POST /v1/nets/{net}/keys", h.withNet(accControl, h.hKeys))
 	mux.HandleFunc("GET /v1/nets/{net}/read", h.withNet(accControl, h.hRead))
 	mux.HandleFunc("POST /v1/nets/{net}/kill", h.withNet(accControl, h.hKill))
@@ -151,14 +168,22 @@ func (h *Hub) actor(r *http.Request, id ident) string {
 // ---- registration ----
 
 type registerReq struct {
-	Name string `json:"name"`
-	Pane string `json:"pane,omitempty"` // caller's $TMUX_PANE, verified here
-	PID  int    `json:"pid,omitempty"`  // fallback liveness binding
+	Name         string `json:"name"`
+	Pane         string `json:"pane,omitempty"` // caller's $TMUX_PANE, verified here
+	Nudge        bool   `json:"nudge,omitempty"`
+	PID          int    `json:"pid,omitempty"` // fallback liveness binding
+	LeaseSeconds int    `json:"lease_seconds,omitempty"`
+	Ephemeral    bool   `json:"ephemeral,omitempty"`
 }
 
 type registerResp struct {
-	Agent string `json:"agent"`
-	Token string `json:"token"`
+	Agent        string `json:"agent"`
+	Token        string `json:"token"`
+	Nudge        bool   `json:"nudge,omitempty"`
+	NudgePolicy  string `json:"nudge_policy"`
+	LeaseSeconds int    `json:"lease_seconds,omitempty"`
+	LeaseExpires int64  `json:"lease_expires,omitempty"`
+	Ephemeral    bool   `json:"ephemeral,omitempty"`
 }
 
 func (h *Hub) hRegister(w http.ResponseWriter, r *http.Request, n *network, id ident) {
@@ -166,17 +191,38 @@ func (h *Hub) hRegister(w http.ResponseWriter, r *http.Request, n *network, id i
 	if !readJSON(w, r, &req) {
 		return
 	}
+	if req.Nudge && req.Pane == "" {
+		httpErr(w, 400, "nudge requires an explicitly bound pane")
+		return
+	}
+	// Binding a pane grants the hub the ability to inject keystrokes into it.
+	// A shared MSG credential may bootstrap message-only/PID-bound agents, but
+	// it must not be enough to point that control path at an arbitrary pane.
+	if req.Pane != "" && !id.Control {
+		httpErr(w, 403, "control layer required to bind a pane")
+		return
+	}
 	if !proto.ValidName(req.Name) {
 		httpErr(w, 400, "bad agent name (want [a-z0-9][a-z0-9_-]*, ≤32)")
 		return
 	}
-	n.regMu.Lock()
-	defer n.regMu.Unlock()
-	if old, ok := n.reg.Get(req.Name); ok && alive(old) {
-		httpErr(w, 409, "name %q is taken by a live agent", req.Name)
+	if req.LeaseSeconds < 0 || req.LeaseSeconds > maxLeaseSeconds {
+		httpErr(w, 400, "lease_seconds must be between 0 and %d", maxLeaseSeconds)
 		return
 	}
-	rec := store.AgentRec{Name: req.Name, Registered: time.Now().UnixMilli()}
+	if req.Ephemeral && req.LeaseSeconds == 0 {
+		httpErr(w, 400, "ephemeral registration requires a positive lease_seconds")
+		return
+	}
+	n.regMu.Lock()
+	defer n.regMu.Unlock()
+	now := time.Now()
+	rec := store.AgentRec{Name: req.Name, Nudge: req.Nudge, Ephemeral: req.Ephemeral, Registered: now.UnixMilli()}
+	if req.LeaseSeconds > 0 {
+		rec.LeaseSeconds = req.LeaseSeconds
+		rec.LastSeen = now.UnixMilli()
+		rec.LeaseExpires = now.Add(time.Duration(req.LeaseSeconds) * time.Second).UnixMilli()
+	}
 	if err := control.AllowClientPane(req.Pane); err != nil {
 		httpErr(w, 400, "%v", err)
 		return
@@ -203,6 +249,18 @@ func (h *Hub) hRegister(w http.ResponseWriter, r *http.Request, n *network, id i
 		}
 		rec.PID, rec.StartEpoch = req.PID, epoch
 	}
+	if old, ok := n.reg.Get(req.Name); ok {
+		if alive(old) {
+			httpErr(w, 409, "name %q is taken by a live agent", req.Name)
+			return
+		}
+		if old.Ephemeral {
+			if err := n.retireInbox(req.Name); err != nil {
+				httpErr(w, 500, "retire expired mailbox: %v", err)
+				return
+			}
+		}
+	}
 	tok := proto.NewToken()
 	rec.TokenHash = proto.HashToken(tok)
 	if err := n.reg.Put(rec); err != nil {
@@ -210,7 +268,74 @@ func (h *Hub) hRegister(w http.ResponseWriter, r *http.Request, n *network, id i
 		return
 	}
 	n.auditLine(h.actor(r, id), "register", req.Name+"@"+h.Cfg.HostName, "")
-	writeJSON(w, 200, registerResp{Agent: req.Name + "@" + h.Cfg.HostName, Token: tok})
+	writeJSON(w, 200, registerResp{
+		Agent: req.Name + "@" + h.Cfg.HostName, Token: tok,
+		Nudge: req.Nudge, NudgePolicy: "explicit",
+		LeaseSeconds: rec.LeaseSeconds, LeaseExpires: rec.LeaseExpires,
+		Ephemeral: rec.Ephemeral,
+	})
+}
+
+type heartbeatResp struct {
+	Agent        string `json:"agent"`
+	LeaseSeconds int    `json:"lease_seconds,omitempty"`
+	LeaseExpires int64  `json:"lease_expires,omitempty"`
+}
+
+func (h *Hub) hHeartbeat(w http.ResponseWriter, r *http.Request, n *network, id ident) {
+	// A network credential can create an identity, but only the minted agent
+	// credential can assert that identity is still present.
+	if id.Agent == "" {
+		httpErr(w, 403, "only agents can heartbeat their own registration")
+		return
+	}
+	// Serialize renewal with name claims. Otherwise a heartbeat could land
+	// between an expired-name check and its replacement, or an already-resolved
+	// old token could accidentally extend the replacement's lease.
+	n.regMu.Lock()
+	rec, ok, err := n.reg.RenewLease(id.Agent, id.TokenHash, time.Now())
+	n.regMu.Unlock()
+	if err != nil {
+		httpErr(w, 500, "registry: %v", err)
+		return
+	}
+	if !ok {
+		httpErr(w, 404, "no such agent")
+		return
+	}
+	writeJSON(w, 200, heartbeatResp{
+		Agent:        rec.Name + "@" + h.Cfg.HostName,
+		LeaseSeconds: rec.LeaseSeconds, LeaseExpires: rec.LeaseExpires,
+	})
+}
+
+// hRelease is the clean-shutdown counterpart to heartbeat for a stable
+// managed identity. It makes presence false immediately but deliberately
+// retains the address and mailbox so peers can queue work while it is offline.
+func (h *Hub) hRelease(w http.ResponseWriter, r *http.Request, n *network, id ident) {
+	if id.Agent == "" {
+		httpErr(w, 403, "only agents can release their own presence lease")
+		return
+	}
+	n.regMu.Lock()
+	rec, ok, err := n.reg.ReleaseLease(id.Agent, id.TokenHash, time.Now())
+	n.regMu.Unlock()
+	if err != nil {
+		if errors.Is(err, store.ErrNotRetainedLease) {
+			httpErr(w, 400, "release: %v", err)
+		} else {
+			httpErr(w, 500, "registry: %v", err)
+		}
+		return
+	}
+	if !ok {
+		httpErr(w, 409, "agent registration was replaced")
+		return
+	}
+	writeJSON(w, 200, heartbeatResp{
+		Agent: rec.Name + "@" + h.Cfg.HostName, LeaseSeconds: rec.LeaseSeconds,
+		LeaseExpires: rec.LeaseExpires,
+	})
 }
 
 func (h *Hub) hDeregister(w http.ResponseWriter, r *http.Request, n *network, id ident) {
@@ -228,9 +353,25 @@ func (h *Hub) hDeregister(w http.ResponseWriter, r *http.Request, n *network, id
 		httpErr(w, 403, "can only deregister yourself without the control token")
 		return
 	}
-	if _, ok := n.reg.Get(name); !ok {
+	// Serialize deletion with name claims and re-check ownership under that
+	// lock. An expired client's request may have authenticated just before a
+	// replacement claimed the same name; it must not delete the replacement.
+	n.regMu.Lock()
+	defer n.regMu.Unlock()
+	rec, ok := n.reg.Get(name)
+	if !ok {
 		httpErr(w, 404, "no such agent")
 		return
+	}
+	if !id.Control && rec.TokenHash != id.TokenHash {
+		httpErr(w, 409, "agent registration was replaced")
+		return
+	}
+	if rec.Ephemeral {
+		if err := n.retireInbox(name); err != nil {
+			httpErr(w, 500, "retire ephemeral mailbox: %v", err)
+			return
+		}
 	}
 	if err := n.reg.Delete(name); err != nil {
 		httpErr(w, 500, "registry: %v", err)
@@ -246,24 +387,37 @@ type agentInfo struct {
 	Agent        string `json:"agent"`
 	Alive        bool   `json:"alive"`
 	Controllable bool   `json:"controllable"`
+	Nudgeable    bool   `json:"nudgeable"`
+	Ephemeral    bool   `json:"ephemeral,omitempty"`
 	Spawned      bool   `json:"spawned,omitempty"`
 	Registered   int64  `json:"registered"`
+	LastSeen     int64  `json:"last_seen,omitempty"`
+	LeaseExpires int64  `json:"lease_expires,omitempty"`
 }
 
 type agentsResp struct {
+	Self        string            `json:"self,omitempty"`
 	Agents      []agentInfo       `json:"agents"`
 	Unreachable map[string]string `json:"unreachable,omitempty"`
 }
 
 func (h *Hub) localAgents(n *network) []agentInfo {
 	var out []agentInfo
+	now := time.Now()
 	for _, rec := range n.reg.List() {
+		if !discoverableAt(rec, now) {
+			continue
+		}
 		out = append(out, agentInfo{
 			Agent:        rec.Name + "@" + h.Cfg.HostName,
-			Alive:        alive(rec),
+			Alive:        aliveAt(rec, now),
 			Controllable: rec.Pane != "",
+			Nudgeable:    rec.Pane != "" && rec.Nudge,
+			Ephemeral:    rec.Ephemeral,
 			Spawned:      rec.Spawned,
 			Registered:   rec.Registered,
+			LastSeen:     rec.LastSeen,
+			LeaseExpires: rec.LeaseExpires,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Agent < out[j].Agent })
@@ -272,6 +426,9 @@ func (h *Hub) localAgents(n *network) []agentInfo {
 
 func (h *Hub) hAgents(w http.ResponseWriter, r *http.Request, n *network, id ident) {
 	resp := agentsResp{Agents: h.localAgents(n), Unreachable: map[string]string{}}
+	if id.Agent != "" {
+		resp.Self = id.Agent + "@" + h.Cfg.HostName
+	}
 	if r.URL.Query().Get("local") == "1" {
 		writeJSON(w, 200, resp)
 		return
@@ -321,6 +478,16 @@ type sendResp struct {
 func (h *Hub) hSend(w http.ResponseWriter, r *http.Request, n *network, id ident) {
 	var req sendReq
 	if !readJSON(w, r, &req) {
+		return
+	}
+	// Request bodies can be streamed arbitrarily slowly. If this agent's name
+	// was reclaimed after withNet resolved its token but before the body
+	// completed, it must not send under the replacement's display identity.
+	// Registry.Get is the operation's ownership linearization point: a reclaim
+	// before it is rejected; a reclaim after it follows an already-authorized
+	// send.
+	if id.Agent != "" && !n.ownsRegistration(id, id.Agent) {
+		httpErr(w, 409, "agent registration was replaced")
 		return
 	}
 	if req.Kind == "" {
@@ -456,11 +623,20 @@ func (h *Hub) hInbox(w http.ResponseWriter, r *http.Request, n *network, id iden
 		httpErr(w, 400, "no agent identity: register first, or pass ?agent= with the control token")
 		return
 	}
-	if _, ok := n.reg.Get(agent); !ok {
+	n.regMu.Lock()
+	rec, ok := n.reg.Get(agent)
+	if !ok {
+		n.regMu.Unlock()
 		httpErr(w, 404, "no such agent")
 		return
 	}
+	if id.Agent != "" && (id.Agent != agent || rec.TokenHash != id.TokenHash) {
+		n.regMu.Unlock()
+		httpErr(w, 409, "agent registration was replaced")
+		return
+	}
 	ib, err := n.inbox(agent)
+	n.regMu.Unlock()
 	if err != nil {
 		httpErr(w, 500, "inbox: %v", err)
 		return
@@ -481,6 +657,10 @@ func (h *Hub) hInbox(w http.ResponseWriter, r *http.Request, n *network, id iden
 	if q.Get("stat") == "1" {
 		res := ib.Read(after, 1)
 		res.Msgs = nil
+		if id.Agent != "" && !n.ownsRegistration(id, agent) {
+			httpErr(w, 409, "agent registration was replaced")
+			return
+		}
 		writeJSON(w, 200, res)
 		return
 	}
@@ -494,6 +674,13 @@ func (h *Hub) hInbox(w http.ResponseWriter, r *http.Request, n *network, id iden
 		ctx, cancel := context.WithTimeout(r.Context(), d)
 		defer cancel()
 		res = ib.Wait(ctx, after, max)
+	}
+	// The token was resolved before a possible long poll. The name may have
+	// expired and been reclaimed while Wait was blocked, in which case res can
+	// contain the replacement's mail. Never return it to the stale generation.
+	if id.Agent != "" && !n.ownsRegistration(id, agent) {
+		httpErr(w, 409, "agent registration was replaced")
+		return
 	}
 	writeJSON(w, 200, res)
 }
@@ -509,16 +696,29 @@ func (h *Hub) hAck(w http.ResponseWriter, r *http.Request, n *network, id ident)
 	if !readJSON(w, r, &req) {
 		return
 	}
+	// Serialize the final ownership check and cursor mutation with name
+	// reclaim. Otherwise an old token can authenticate, stall while its body is
+	// read, then advance the replacement's cursor.
+	n.regMu.Lock()
+	if !n.ownsRegistration(id, id.Agent) {
+		n.regMu.Unlock()
+		httpErr(w, 409, "agent registration was replaced")
+		return
+	}
 	ib, err := n.inbox(id.Agent)
 	if err != nil {
+		n.regMu.Unlock()
 		httpErr(w, 500, "inbox: %v", err)
 		return
 	}
 	if err := ib.Ack(req.Seq); err != nil {
+		n.regMu.Unlock()
 		httpErr(w, 400, "%v", err)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"cursor": ib.Cursor()})
+	cursor := ib.Cursor()
+	n.regMu.Unlock()
+	writeJSON(w, 200, map[string]any{"cursor": cursor})
 }
 
 // ---- hosts ----
@@ -649,17 +849,20 @@ type spawnReq struct {
 	// clients set Profile, not this.
 	Provision    *provisionSpec `json:"provision,omitempty"`
 	GrantControl bool           `json:"grant_control,omitempty"`
+	Nudge        bool           `json:"nudge,omitempty"` // opt into fixed terminal wake notices
 	WaitReady    bool           `json:"wait_ready,omitempty"`
 	Headed       bool           `json:"headed,omitempty"`  // open a visible terminal window attached to the session
 	Persist      bool           `json:"persist,omitempty"` // declare it: the daemon respawns it after reboot/crash
 }
 
 type spawnResp struct {
-	Agent   string `json:"agent"`
-	Session string `json:"session"`
-	Pane    string `json:"pane"`
-	Ready   bool   `json:"ready"`
-	Window  string `json:"window,omitempty"` // headed result: "opened" or the error
+	Agent       string `json:"agent"`
+	Session     string `json:"session"`
+	Pane        string `json:"pane"`
+	Nudge       bool   `json:"nudge,omitempty"`
+	NudgePolicy string `json:"nudge_policy"`
+	Ready       bool   `json:"ready"`
+	Window      string `json:"window,omitempty"` // headed result: "opened" or the error
 }
 
 func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id ident) {
@@ -736,17 +939,28 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 		// update, not a conflict — that makes `spawn --persist` idempotent
 		// ("ensure declared and running"), e.g. on re-provisioning.
 		if serr.code == 409 && req.Persist {
-			if old, ok := n.reg.Get(req.Name); ok && alive(old) && old.Session == session {
+			n.regMu.Lock()
+			old, ok := n.reg.Get(req.Name)
+			if ok && alive(old) && old.Session == session {
+				if old.Nudge != req.Nudge {
+					n.regMu.Unlock()
+					httpErr(w, 409, "agent %q is already live with nudge=%v; kill it before changing terminal-wake policy", req.Name, old.Nudge)
+					return
+				}
 				if err := h.declare(n, req); err != nil {
+					n.regMu.Unlock()
 					httpErr(w, 500, "persist: %v", err)
 					return
 				}
+				n.regMu.Unlock()
 				n.auditLine(h.actor(r, id), "spawn", req.Name+"@"+h.Cfg.HostName, "already live; declaration updated")
 				writeJSON(w, 200, spawnResp{
-					Agent: old.Name + "@" + h.Cfg.HostName, Session: old.Session, Pane: old.Pane, Ready: true,
+					Agent: old.Name + "@" + h.Cfg.HostName, Session: old.Session, Pane: old.Pane,
+					Nudge: old.Nudge, NudgePolicy: "explicit", Ready: true,
 				})
 				return
 			}
+			n.regMu.Unlock()
 		}
 		httpErr(w, serr.code, "%s", serr.msg)
 		return
@@ -779,7 +993,7 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 	}
 	writeJSON(w, 200, spawnResp{
 		Agent: rec.Name + "@" + h.Cfg.HostName, Session: rec.Session, Pane: rec.Pane,
-		Ready: ready, Window: window,
+		Nudge: rec.Nudge, NudgePolicy: "explicit", Ready: ready, Window: window,
 	})
 }
 
@@ -787,7 +1001,7 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 func (h *Hub) declare(n *network, req spawnReq) error {
 	return n.persist.Put(store.PersistSpec{
 		Name: req.Name, Cmd: req.Cmd, Cwd: req.Cwd,
-		GrantControl: req.GrantControl, Declared: time.Now().UnixMilli(),
+		GrantControl: req.GrantControl, Nudge: req.Nudge, Declared: time.Now().UnixMilli(),
 	})
 }
 
@@ -863,17 +1077,23 @@ func (h *Hub) spawnCore(n *network, actor string,
 		control.KillSession(session, pane)
 		return store.AgentRec{}, &spawnErr{500, "spawned process died immediately"}
 	}
+	if old, ok := n.reg.Get(req.Name); ok && old.Ephemeral {
+		if err := n.retireInbox(req.Name); err != nil {
+			control.KillSession(session, pane)
+			return store.AgentRec{}, &spawnErr{500, fmt.Sprintf("retire expired mailbox: %v", err)}
+		}
+	}
 	rec := store.AgentRec{
 		Name: req.Name, TokenHash: proto.HashToken(tok),
 		Pane: pane, Session: session, PID: pid, StartEpoch: epoch,
-		Spawned: true, Registered: time.Now().UnixMilli(),
+		Spawned: true, Nudge: req.Nudge, Registered: time.Now().UnixMilli(),
 	}
 	if err := n.reg.Put(rec); err != nil {
 		control.KillSession(session, pane)
 		return store.AgentRec{}, &spawnErr{500, fmt.Sprintf("registry: %v", err)}
 	}
 	n.auditLine(actor, "spawn", rec.Name+"@"+h.Cfg.HostName,
-		fmt.Sprintf("cmd=%q grant_control=%v headed=%v persist=%v", strings.Join(req.Cmd, " "), req.GrantControl, req.Headed, req.Persist))
+		fmt.Sprintf("cmd=%q grant_control=%v nudge=%v headed=%v persist=%v", strings.Join(req.Cmd, " "), req.GrantControl, req.Nudge, req.Headed, req.Persist))
 	return rec, nil
 }
 
@@ -1023,44 +1243,59 @@ func (h *Hub) hKill(w http.ResponseWriter, r *http.Request, n *network, id ident
 		return
 	}
 	name := strings.TrimSuffix(req.Agent, "@"+h.Cfg.HostName)
-	rec, ok := n.reg.Get(name)
-	if !ok {
-		// A declared-but-dead session has no registry record; forgetting it
-		// must still work, else the reconciler resurrects it forever.
-		if req.Forget {
-			if _, declared := n.persist.Get(name); declared {
-				if err := n.persist.Delete(name); err != nil {
-					httpErr(w, 500, "persist: %v", err)
-					return
-				}
-				n.auditLine(h.actor(r, id), "kill", name+"@"+h.Cfg.HostName, "forgot declaration (no live agent)")
-				writeJSON(w, 200, map[string]any{"killed": false, "deregistered": false, "forgotten": true})
-				return
-			}
-		}
-		httpErr(w, 404, "no such agent")
-		return
-	}
 	// Drop the declaration BEFORE killing: the reconciler must not race the
 	// kill and respawn what the caller is tearing down. A plain kill leaves
 	// the declaration, so a declared agent comes back on the next sweep.
 	forgotten := false
+	hadDeclaration := false
 	if req.Forget {
+		_, hadDeclaration = n.persist.Get(name)
 		if err := n.persist.Delete(name); err != nil {
 			httpErr(w, 500, "persist: %v", err)
 			return
 		}
 		forgotten = true
 	}
-	killed := false
-	if rec.Spawned && rec.Session != "" {
-		if err := control.KillSession(rec.Session, rec.Pane); err == nil {
-			killed = true
+
+	// Atomically detach the exact registration before the potentially slow
+	// external teardown. Registration and spawn claims use the same regMu, so
+	// no stale Delete can land after a replacement has claimed the reusable
+	// name. Releasing the lock before KillSession also lets a pane-less claimant
+	// join immediately; a spawned claimant safely waits for the old session
+	// name to disappear from the control backend.
+	n.regMu.Lock()
+	rec, ok := n.reg.Get(name)
+	if !ok {
+		n.regMu.Unlock()
+		// A declared-but-dead session has no registry record; forgetting it
+		// must still work, else the reconciler resurrects it forever.
+		if forgotten && hadDeclaration {
+			n.auditLine(h.actor(r, id), "kill", name+"@"+h.Cfg.HostName, "forgot declaration (no live agent)")
+			writeJSON(w, 200, map[string]any{"killed": false, "deregistered": false, "forgotten": true})
+			return
+		}
+		httpErr(w, 404, "no such agent")
+		return
+	}
+	if rec.Ephemeral {
+		if err := n.retireInbox(name); err != nil {
+			n.regMu.Unlock()
+			httpErr(w, 500, "retire ephemeral mailbox: %v", err)
+			return
 		}
 	}
 	if err := n.reg.Delete(name); err != nil {
+		n.regMu.Unlock()
 		httpErr(w, 500, "registry: %v", err)
 		return
+	}
+	n.regMu.Unlock()
+
+	killed := false
+	if rec.Spawned && rec.Session != "" {
+		if err := h.killSession(rec.Session, rec.Pane); err == nil {
+			killed = true
+		}
 	}
 	n.auditLine(h.actor(r, id), "kill", name+"@"+h.Cfg.HostName, fmt.Sprintf("killed_session=%v forgotten=%v", killed, forgotten))
 	writeJSON(w, 200, map[string]any{"killed": killed, "deregistered": true, "forgotten": forgotten})

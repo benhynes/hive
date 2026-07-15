@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -28,6 +29,8 @@ func main() {
 		err = runNet(args)
 	case "register":
 		err = runRegister(args)
+	case "run":
+		err = runRun(args)
 	case "deregister":
 		err = runDeregister(args)
 	case "agents":
@@ -58,6 +61,10 @@ func main() {
 		os.Exit(2)
 	}
 	if err != nil {
+		var childExit *runExitError
+		if errors.As(err, &childExit) {
+			os.Exit(childExit.ExitCode())
+		}
 		fmt.Fprintln(os.Stderr, "hive: "+err.Error())
 		os.Exit(1)
 	}
@@ -113,16 +120,22 @@ NETWORKS
   hive net rotate-control <name>           replace this hub's control token with a host-local token
 
 IDENTITY
-  hive register --name N [--pane %ID]      register self, prints export lines
+  hive register --name N [--pane %ID [--nudge]] [--pid PID]
+                                            register self, prints export lines
+  hive run [--name N] [--cwd D] -- CMD...  run a foreground command with a leased,
+                                           agent-scoped identity (no tmux;
+                                           no control credential injected;
+                                           Ctrl-Z job control is not proxied)
   hive deregister [name]
   hive agents [--local] [--json]           list agents across the mesh
 
 MESSAGING is MCP-only — agents send/recv/ask/answer via the hive_* tools.
-  hive mcp [--list]                        stdio MCP server: hive_send, hive_recv,
+  hive mcp [--name N] [--list]             auto-enrolling stdio MCP server:
+                                           hive_send, hive_recv,
                                            hive_ask, hive_answer, hive_asks,
                                            hive_agents (+ spawn/keys/read/kill
-                                           when the agent holds control).
-                                           Register once per agent:
+                                           when control was explicitly granted).
+                                           Configure once in the runtime:
                                              claude mcp add hive -- hive mcp
                                            --list prints the tools and exits.
 
@@ -140,8 +153,10 @@ HOSTS (control layer)
                                            bootstrap a permanent host over ssh
 
 CONTROL (control layer; goes direct to the target host)
-  hive spawn [--host H] [--cwd D] [--profile P] [--grant-control] [--wait] [--headed] [--persist] <name> [-- CMD...]
+  hive spawn [--host H] [--cwd D] [--profile P] [--grant-control] [--wait] [--headed] [--nudge] [--persist] <name> [-- CMD...]
                                             --persist: daemon respawns it after reboot/crash
+                                            --nudge: allow fixed terminal wake + Enter;
+                                            controlled idle panes only
                                             --profile: provision the cwd from ~/.hive/profiles/P.json
                                             (context files + .mcp.json with the hive server,
                                             pre-approved so a headless agent sees no prompts;

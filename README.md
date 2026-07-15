@@ -1,10 +1,10 @@
 # hive
 
-An agent communication + control mesh for TUI agents. One Go binary, no
-dependencies beyond `tmux ≥ 3.2`. Agents on any number of hosts discover
-each other, exchange messages, ask each other questions, and — with the
-right credential — spawn, type into, read, and kill each other's
-terminal sessions.
+An agent communication + control mesh for terminal agents. One Go binary;
+messaging has no terminal-supervisor dependency. Agents on any number of hosts
+discover each other, exchange messages, and ask each other questions. On Unix,
+optional managed-session control uses `tmux ≥ 3.2` to spawn, inspect, type into,
+and kill terminal sessions.
 
 Built for meshes of coding agents (Claude Code, etc.). Agents talk to the
 mesh through **MCP tools** (`hive mcp`); the hub itself is plain HTTP+JSON,
@@ -13,10 +13,10 @@ which the `hive` CLI and the MCP server are both thin clients of.
 ```
 ┌─ mac ────────────────┐        ┌─ vm1 ────────────────┐
 │  hive daemon :7777   │◀──────▶│  hive daemon :7777   │
-│  ├─ alice (tmux)     │  HTTP  │  ├─ bob   (tmux)     │
+│  ├─ alice (MCP)      │  HTTP  │  ├─ bob (hive run)   │
 │  └─ ci-bot           │        │  └─ worker (tmux)    │
 └──────────────────────┘        └──────────────────────┘
-        ▲ CLI / API                      ▲ tmux attach
+        ▲ CLI / MCP                      ▲ MCP / optional control
 ```
 
 ## Design in one breath
@@ -26,8 +26,9 @@ serves many, nothing crosses them. Exactly **two permission layers**:
 `MSG` (send/recv/ask/answer/discover) and `CONTROL` (everything a human
 at the keyboard could do). Agent identity is real: `from` is stamped
 from the authenticated token, so a MSG agent can never impersonate — or
-control — anyone. tmux is the control substrate; humans can always
-`tmux attach` and watch.
+control — anyone. Identity and durable mail do not depend on a terminal pane.
+Tmux is an optional Unix control substrate; humans can `tmux attach` and watch
+managed sessions. Automatic terminal wake is separately opt-in (`--nudge`).
 
 ## Install
 
@@ -45,39 +46,64 @@ human set up and drive the mesh by hand. There is no `hive send`/`recv`/`ask`
 hive net create dev          # prints the network's msg + control tokens
 hive daemon &                # one per host (127.0.0.1:7777 by default)
 
-# Spawn an agent into the mesh (a tmux session with HIVE_* injected). Point it
-# at hive over MCP so it can message the rest of the mesh:
-hive spawn worker -- claude --dangerously-skip-permissions
-hive read worker             # what's on its screen? (human inspection)
-hive keys --enter worker "claude mcp add hive -- hive mcp"
+# Configure Hive as an MCP server once in your agent runtime:
+claude mcp add hive -- hive mcp
 
-# Drive it by hand:
-hive keys --enter worker "please run the tests"
+# Launch normally. hive mcp lazily enrolls a leased message identity:
+claude
+
+# Or choose a stable name while keeping the current terminal (no tmux):
+hive run --name worker -- claude --dangerously-skip-permissions
+
+# Tmux remains available when managed control/observation is wanted:
+hive spawn managed -- claude --dangerously-skip-permissions
+hive read managed
 ```
 
 ## MCP — the agent interface
 
-Agents call the mesh as native tools. Register the server once, in the agent:
+Agents call the mesh as native tools. Configure the server once in the runtime:
 
 ```sh
 claude mcp add hive -- hive mcp
 ```
 
-`hive mcp` is a stdio MCP server. It authenticates from the same `HIVE_*`
-env vars `hive spawn` already injects, so a spawned agent needs no
-configuration at all. It offers `hive_send`, `hive_recv`, `hive_ask`,
-`hive_answer`, `hive_asks`, and `hive_agents` — plus `hive_spawn`,
-`hive_keys`, `hive_read`, and `hive_kill` when the agent holds the
-control credential. **The two permission layers are enforced by omission:**
-an MSG-only agent is never even shown the control tools, so a model
-cannot plan around a capability it does not have. `hive mcp --list` prints
-exactly what a given agent would be offered.
+`hive mcp` is a stdio MCP server. When `hive spawn` or `hive run` supplied an
+identity, it authenticates from those `HIVE_*` variables. Otherwise it
+automatically registers a generated, renewable identity with the local hub;
+pass `hive mcp --name alice` to choose a stable name. Enrollment is lazy: the
+stdio MCP handshake starts even if the hub is temporarily unavailable or a
+name's old lease is still live, while enrollment retries in the background.
+Calls to Hive tools remain gated until an identity has been minted (and return
+an enrollment error while it cannot be), so the bootstrap network credential
+is never used as an agent identity.
+
+The managed lease is 60 seconds and is renewed every 15 seconds. Generated MCP
+and unnamed `hive run` identities are disposable: clean exit deregisters them
+and removes their mailbox. After an unclean exit they disappear from discovery
+when the lease expires; the old token and mailbox remain recoverable for up to
+24 hours so a suspended or partitioned process can resume, then the daemon
+retires them. Do not use a generated address as an offline durable destination.
+Explicit `--name` identities instead release presence on clean exit and keep
+their address and mailbox, so peers can queue durable mail while they are
+offline. A named replacement can reclaim the address immediately after a clean
+release, or after the 60-second lease expires following a crash.
+
+It offers `hive_send`, `hive_recv`, `hive_ask`, `hive_answer`, `hive_asks`,
+and `hive_agents` — plus `hive_spawn`, `hive_keys`, `hive_read`, and
+`hive_kill` only when an explicit control credential was supplied. **The two
+permission layers are enforced by omission:** an MSG-only agent is never even
+shown the control tools, so a model cannot plan around a capability it does
+not have. `hive mcp --list` prints what the process would be offered without
+registering or contacting the daemon.
 
 The MCP tools and the hub's HTTP API are the same operations against the same
 hub, so an MCP agent and a human running `hive` from a shell are peers on one
 mesh. The CLI keeps the infrastructure and human-driving verbs — `daemon`,
-`net`, `node`, `register`, `hosts`, `spawn`, `read`, `keys`, `kill`, `agents` —
-but the agent-messaging verbs are gone; agents use the tools.
+`net`, `node`, `register`, `run`, `deregister`, `hosts`, `spawn`, `read`,
+`keys`, `kill`, `agents` — but the agent-messaging verbs are gone; agents use
+the tools. `hive_agents` returns the caller's address in its top-level `self`
+field, including for automatically generated identities.
 
 One thing MCP does not change: **nothing pushes mail to an idle model.** An
 MCP server cannot wake a model that isn't already running. The fast path is
@@ -85,9 +111,33 @@ therefore to *wait inside a receive*: an agent parked in `hive_recv` with
 `wait` is woken the instant a message is appended — the hub closes a channel
 on write, it does not poll — so delivery to a waiting worker is
 sub-millisecond and arrives as the return value of the call it's already in.
-An agent that is busy elsewhere instead gets a terminal nudge carrying a
-preview of the waiting message. Both paths work; parking in `hive_recv` is the
-one to design worker loops around.
+An agent explicitly spawned or pane-registered with `--nudge` may instead get
+a fixed `hive_recv` reminder; message bodies are never typed into its terminal.
+This opt-in sends Enter and can submit a draft typed concurrently after Hive's
+idle-prompt check, so it is only for controlled idle panes. Pane binding alone
+never enables it. Parking in `hive_recv` is the safe default and the path to
+design worker loops around.
+
+`hive run` is a foreground wrapper: stdin/stdout/stderr and the child's exit
+status are preserved and CONTROL is stripped. On Linux, macOS, and the BSDs it
+places the child in a process group and forwards SIGINT/SIGTERM to that group;
+on other platforms it signals the direct child. This is deliberately not a
+full shell job-control implementation: Ctrl-Z suspension is unsupported, and a
+descendant that creates a new process group can escape group signaling.
+
+Tmux adoption is available when terminal observation/control is actually
+wanted, but it is not part of joining the message mesh. From inside the pane,
+bind it explicitly (and hold a CONTROL credential):
+
+```sh
+eval "$(hive register --name worker --pane "$TMUX_PANE")"
+
+# Alternative for a controlled idle pane that may be woken with Enter:
+eval "$(hive register --name worker --pane "$TMUX_PANE" --nudge)"
+```
+
+Omit `--pane` for a message-only manual registration. Hive never infers
+`$TMUX_PANE`, and pane binding alone never opts into automatic terminal input.
 
 ## Spawn profiles — provisioned agents
 
@@ -159,6 +209,9 @@ user is admin, and pins state with `daemon --home`. Windows hosts are
 Windows uses the classic console API (`internal/control`), so
 `spawn`/`read`/`keys`/`kill` work the same way. Pass `--msg-only` to
 withhold control or `--local-control` to keep it on the Windows host.
+Manual client-supplied pane binding is not supported on Windows: use `--pid`
+for liveness-only registration. Console control is available for sessions that
+the Windows hub itself spawned.
 See [docs/windows-control.md](docs/windows-control.md).
 
 Or manually:
@@ -230,6 +283,9 @@ hub: loopback forwards sidestep macOS Local-Network TCC. See
   bound to one `control_host`. Agent tokens (minted at registration) are
   always MSG-layer.
 - **Identity.** `from` is server-stamped from the token. No spoofing.
+- **Terminal attachment.** Binding a tmux pane requires CONTROL. A MSG
+  credential can create a pane-less or PID-bound identity, but cannot select a
+  pane that Hive will type into.
 - **Isolation.** State, tokens, agents, and hosts lists are all
   per-network.
 - **Transport.** Bind to your tailnet; Tailscale is the transport
@@ -252,14 +308,16 @@ hive daemon [--bind ADDR] [--port N]
 hive net    create <name> | join <name> --hub A --msg-token T [--control-token T] | list | show <name>
 
 # Identity + MCP
-hive register --name N [--pane %ID]     # prints export lines; eval them
-hive agents [--local] [--json]          # list agents across the mesh
-hive mcp [--list]                       # stdio MCP server: the agent interface
+hive register --name N [--pane %ID [--nudge]] [--pid PID] # --nudge is explicit terminal wake consent
+hive run [--name N] [--cwd D] -- CMD...         # foreground command; leased agent identity; no tmux
+hive deregister [name]
+hive agents [--local] [--json]                  # presence + retained/disposable mailbox policy
+hive mcp [--name N] [--list]                    # auto-enrolling stdio agent interface
 
 # CONTROL layer (direct to the target host's hub)
 hive hosts  list | add <name> <addr:port> | rm <name>
 hive net rotate-control <name>            # fresh host-local token on this hub
-hive spawn [--host H] [--cwd D] [--grant-control] [--wait] [--headed] <name> -- CMD...
+hive spawn [--host H] [--cwd D] [--grant-control] [--wait] [--headed] [--nudge] <name> -- CMD...
 hive keys [--enter] <agent> <text...>
 hive read [--lines N] <agent>
 hive kill <agent>
@@ -270,11 +328,13 @@ Wire format and semantics: **docs/PROTOCOL.md**.
 
 ## Demo
 
-`demo/two-node-demo.sh` runs two hubs on this machine (separate state
-dirs, a dedicated tmux socket), joins them into one network, and walks
-the whole surface: spawn, keys/read, MCP messaging (send/recv/ask/answer/
-broadcast) driven through `hive mcp`, nudge, audit. Safe to run repeatedly;
-cleans up after itself. (Needs `python3` for the demo's MCP client.)
+`demo/two-node-demo.sh` runs two hubs on this machine (separate state dirs and a
+dedicated tmux socket), joins them into one network, and starts with the
+recommended no-tmux path: Alice lazily enrolls by name through `hive mcp`.
+It then uses one optional managed tmux worker to demonstrate spawn, keys/read,
+nudge, and kill alongside MCP send/recv/ask/answer/broadcast and audit. Safe to
+run repeatedly; cleans up after itself. (Needs `python3` for the demo's MCP
+client and tmux for the optional-control half.)
 
 ## Repo layout
 

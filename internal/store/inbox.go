@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -43,8 +44,13 @@ type Inbox struct {
 	fileLines int
 	seen      map[string]bool // envelope id -> present in retained window
 	waiters   map[chan struct{}]bool
-	pollers   int // live long-polls (nudge suppression)
+	pollers   int  // live long-polls (nudge suppression)
+	retired   bool // disposable identity was removed; this object may not recreate its files
 }
+
+// ErrInboxRetired prevents a stale in-memory mailbox reference from
+// recreating files after its disposable registration has been removed.
+var ErrInboxRetired = errors.New("inbox retired")
 
 // OpenInbox loads (or creates) the inbox for an agent under dir.
 func OpenInbox(dir, name string) (*Inbox, error) {
@@ -64,6 +70,47 @@ func OpenInbox(dir, name string) (*Inbox, error) {
 		return nil, err
 	}
 	return ib, nil
+}
+
+// RemoveInbox deletes every durable file belonging to a disposable mailbox.
+// Callers must first revoke the registration and exclude concurrent append/ack
+// operations; named mailboxes are intentionally never passed here.
+func RemoveInbox(dir, name string) error {
+	base := filepath.Join(dir, "inbox", name+".jsonl")
+	cursor := filepath.Join(dir, "cursors", name)
+	var firstErr error
+	for _, path := range []string{base, base + ".tmp", cursor, cursor + ".tmp"} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// Retire permanently invalidates this in-memory mailbox, wakes any long
+// polls, clears message data, and removes its durable files. Callers must
+// serialize it with registration/name reuse; methods on a stale pointer will
+// never recreate the mailbox afterward.
+func (ib *Inbox) Retire() error {
+	ib.mu.Lock()
+	defer ib.mu.Unlock()
+	ib.retired = true
+	ib.recs = nil
+	ib.nextSeq = 1
+	ib.cursor = 0
+	ib.fileLines = 0
+	ib.seen = map[string]bool{}
+	for w := range ib.waiters {
+		close(w)
+		delete(ib.waiters, w)
+	}
+	var firstErr error
+	for _, path := range []string{ib.path, ib.path + ".tmp", ib.cursorP, ib.cursorP + ".tmp"} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func (ib *Inbox) load() error {
@@ -122,6 +169,9 @@ func (ib *Inbox) loadCursor() error {
 func (ib *Inbox) Append(env proto.Envelope) (int64, bool, error) {
 	ib.mu.Lock()
 	defer ib.mu.Unlock()
+	if ib.retired {
+		return 0, false, ErrInboxRetired
+	}
 	if ib.seen[env.ID] {
 		for _, r := range ib.recs {
 			if r.Env.ID == env.ID {
@@ -236,6 +286,9 @@ func (ib *Inbox) readLocked(after int64, max int) ReadResult {
 func (ib *Inbox) Ack(seq int64) error {
 	ib.mu.Lock()
 	defer ib.mu.Unlock()
+	if ib.retired {
+		return ErrInboxRetired
+	}
 	if seq <= ib.cursor {
 		return nil
 	}
@@ -279,7 +332,7 @@ func (ib *Inbox) Wait(ctx context.Context, after int64, max int) ReadResult {
 	for {
 		ib.mu.Lock()
 		res := ib.readLocked(after, max)
-		if len(res.Msgs) > 0 || ctx.Err() != nil {
+		if len(res.Msgs) > 0 || ctx.Err() != nil || ib.retired {
 			ib.mu.Unlock()
 			return res
 		}

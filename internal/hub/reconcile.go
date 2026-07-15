@@ -47,7 +47,7 @@ func (h *Hub) reconcileOnce() {
 			}
 			req := spawnReq{
 				Name: spec.Name, Cmd: spec.Cmd, Cwd: spec.Cwd,
-				GrantControl: spec.GrantControl, Persist: true,
+				GrantControl: spec.GrantControl, Nudge: spec.Nudge, Persist: true,
 			}
 			tok, env, err := h.spawnEnv(n, req)
 			if err != nil {

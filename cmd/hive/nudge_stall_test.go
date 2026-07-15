@@ -1,8 +1,8 @@
 // Does an idle agent reliably learn it has mail?
 //
-// The nudge is the ONLY thing that wakes an idle TUI agent, and it fires only
-// as a side effect of delivery. This test asks whether a message that arrives
-// inside the coalescing window is ever announced.
+// An explicitly opted-in nudge is the only terminal-side thing that wakes an
+// idle TUI agent. This test first proves the safe default types nothing, then
+// asks whether opted-in mail inside the coalescing window is ever announced.
 package main
 
 import (
@@ -19,10 +19,10 @@ func paneText(t *testing.T, env []string, agent string) string {
 }
 
 // countNudges counts how many times the hub typed a mail nudge into the pane.
-// Every nudge — preview or fallback — starts with the "hive: " marker followed
-// by the sender, so the sender-tagged form is the reliable thing to count.
+// The notice is fixed: sender/body bytes are deliberately never terminal
+// input, and the leading shell comment keeps it inert if the agent has exited.
 func countNudges(screen string) int {
-	return strings.Count(screen, "sender@nudgehost")
+	return strings.Count(screen, "# hive: unread messages waiting - call the hive_recv tool")
 }
 
 func TestIdleAgentIsToldAboutEveryMessage(t *testing.T) {
@@ -45,22 +45,35 @@ func TestIdleAgentIsToldAboutEveryMessage(t *testing.T) {
 	}
 	sender := register(t, h, "sender")
 
-	// A real tmux-bound agent, idle at a shell prompt — the pane exists, so it
-	// is nudgeable, and it never polls its own inbox.
-	mustCLI(t, h.env(), "spawn", "idle", "--", "sh")
+	// Pane binding alone is not permission to inject input. With the default
+	// (no --nudge), delivering mail must leave an idle shell byte-for-byte as it
+	// was, including never pressing Enter.
+	mustCLI(t, h.env(), "spawn", "quiet", "--", "sh")
+	time.Sleep(500 * time.Millisecond)
+	before := paneText(t, h.env(), "quiet")
+	apiSend(t, sender, "quiet", "durable but no terminal input")
+	time.Sleep(1 * time.Second)
+	after := paneText(t, h.env(), "quiet")
+	if after != before || countNudges(after) != 0 {
+		t.Fatalf("non-opt-in pane changed after mail delivery\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	mustCLI(t, h.env(), "kill", "quiet")
+
+	// A real tmux-bound agent, idle at a shell prompt and explicitly opted into
+	// automatic wake. It never polls its own inbox.
+	mustCLI(t, h.env(), "spawn", "--nudge", "idle", "--", "sh")
 	time.Sleep(500 * time.Millisecond)
 
-	// First message: the agent is idle and un-nudged, so this must announce,
-	// and the announcement must carry the sender + a body preview so the agent
-	// can act without a round trip through recv.
+	// First message: the agent is idle and un-nudged, so this must announce
+	// that mail is waiting without typing peer-controlled content.
 	apiSend(t, sender, "idle", "first message")
 	time.Sleep(1 * time.Second)
 	screen := paneText(t, h.env(), "idle")
 	if n := countNudges(screen); n != 1 {
 		t.Fatalf("first message: got %d nudges on screen, want 1:\n%s", n, screen)
 	}
-	if !strings.Contains(screen, "sender@nudgehost") || !strings.Contains(screen, "first message") {
-		t.Errorf("nudge should carry sender + body preview, got:\n%s", screen)
+	if strings.Contains(screen, "sender@nudgehost") || strings.Contains(screen, "first message") {
+		t.Errorf("nudge injected sender/body text, got:\n%s", screen)
 	}
 
 	// Second message, well inside the coalescing window, and no further traffic

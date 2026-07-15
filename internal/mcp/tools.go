@@ -55,11 +55,30 @@ func jsonOut(v any) (string, error) {
 	return string(b), nil
 }
 
+type agentsOutput struct {
+	Self        string             `json:"self"`
+	Agents      []client.AgentInfo `json:"agents"`
+	Unreachable map[string]string  `json:"unreachable,omitempty"`
+}
+
+func addSelfToAgents(self string, res client.AgentsResp) agentsOutput {
+	if res.Self != "" {
+		self = res.Self
+	}
+	return agentsOutput{
+		Self:        self,
+		Agents:      res.Agents,
+		Unreachable: res.Unreachable,
+	}
+}
+
 func agentsTool(c *client.Client) Tool {
 	return Tool{
 		Name: "hive_agents",
-		Description: "List the agents on the hive mesh and whether each is alive. " +
-			"Use this to discover who you can message before sending.",
+		Description: "List the agents on the hive mesh and whether each is alive. The top-level " +
+			"`self` field is your own name@host identity. Use this to discover who you can message " +
+			"and how peers can address you. `ephemeral: true` means that agent's unread mailbox is " +
+			"disposable when it exits; named retained agents remain addressable while offline.",
 		Schema: schema(`{
   "type": "object",
   "properties": {
@@ -77,7 +96,7 @@ func agentsTool(c *client.Client) Tool {
 			if err != nil {
 				return "", err
 			}
-			return jsonOut(res)
+			return jsonOut(addSelfToAgents(c.Agent, res))
 		},
 	}
 }
@@ -87,7 +106,8 @@ func sendTool(c *client.Client) Tool {
 		Name: "hive_send",
 		Description: "Send a message to another agent. `to` is name@host, or a bare name for an " +
 			"agent on your own host, or @all to broadcast to everyone but you. Delivery is durable: " +
-			"the message waits in the recipient's inbox until they read it. Bodies are capped at 8 KiB — " +
+			"for retained named agents, the message waits through offline periods until read. An agent " +
+			"advertised as `ephemeral` has a disposable inbox instead. Bodies are capped at 8 KiB — " +
 			"point at files or URLs instead of pasting large blobs.",
 		Schema: schema(`{
   "type": "object",
@@ -354,6 +374,7 @@ func spawnTool(c *client.Client) Tool {
     "grant_control": {"type": "boolean", "description": "Give the new agent the CONTROL credential too. It will be able to spawn and control other agents."},
     "wait_ready":    {"type": "boolean", "description": "Wait until the agent's pane stops changing (up to 15s) before returning."},
     "headed":        {"type": "boolean", "description": "Also open a visible terminal window on the target host so a human can watch."},
+    "nudge":         {"type": "boolean", "description": "Opt into fixed automatic terminal wake + Enter. Use only for a controlled idle pane; a concurrently typed draft may be submitted."},
     "persist":       {"type": "boolean", "description": "Respawn this agent automatically after a reboot."}
   },
   "required": ["name", "cmd"]
@@ -368,6 +389,7 @@ func spawnTool(c *client.Client) Tool {
 				GrantControl bool     `json:"grant_control"`
 				WaitReady    bool     `json:"wait_ready"`
 				Headed       bool     `json:"headed"`
+				Nudge        bool     `json:"nudge"`
 				Persist      bool     `json:"persist"`
 			}
 			if err := decode(args, &a); err != nil {
@@ -376,7 +398,7 @@ func spawnTool(c *client.Client) Tool {
 			if a.Name == "" || len(a.Cmd) == 0 {
 				return "", fmt.Errorf("`name` and a non-empty `cmd` are required")
 			}
-			res, err := c.Spawn(a.Host, a.Name, a.Cmd, a.Cwd, a.Profile, a.GrantControl, a.WaitReady, a.Headed, a.Persist)
+			res, err := c.SpawnWithNudge(a.Host, a.Name, a.Cmd, a.Cwd, a.Profile, a.GrantControl, a.WaitReady, a.Headed, a.Nudge, a.Persist)
 			if err != nil {
 				return "", err
 			}

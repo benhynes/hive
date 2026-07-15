@@ -9,25 +9,31 @@ import (
 
 // runRegister registers the calling agent with the local hub and prints
 // export lines on stdout so a shell can `eval "$(hive register ...)"`.
-// With a pane bound (tmux pane id on Unix, win:<pid> on Windows) the
-// agent is nudgeable + controllable; without one it is message-only.
+// With an explicitly bound tmux pane on Unix the agent is controllable.
+// Client-supplied pane bindings are intentionally unsupported on Windows;
+// --pid there provides liveness only, while hub-spawned consoles are the
+// controllable path. Automatic terminal wake notices require --nudge.
 func runRegister(args []string) error {
 	fs := flags("register", args)
 	name := fs.String("name", "", "agent name (unique per host per network)")
-	pane := fs.String("pane", os.Getenv("TMUX_PANE"), "tmux pane id to bind (default $TMUX_PANE)")
+	pane := fs.String("pane", "", "tmux pane id to bind explicitly (requires CONTROL; e.g. $TMUX_PANE)")
+	nudge := fs.Bool("nudge", false, "opt into automatic terminal wake + Enter (requires --pane; controlled idle panes only)")
 	pid := fs.Int("pid", 0, "process id to bind for liveness (optional, outside tmux)")
 	fs.Parse2()
 	if *name == "" {
 		*name = fs.pos(0)
 	}
 	if *name == "" {
-		return fmt.Errorf("usage: hive register --name <name> [--pane %%ID]")
+		return fmt.Errorf("usage: hive register --name <name> [--pane %%ID [--nudge]] [--pid PID]")
+	}
+	if *nudge && *pane == "" {
+		return fmt.Errorf("--nudge requires an explicit --pane (and CONTROL credential)")
 	}
 	c, err := client.Resolve(*fs.net)
 	if err != nil {
 		return err
 	}
-	resp, err := c.Register(*name, *pane, *pid)
+	resp, err := c.RegisterWithNudge(*name, *pane, *pid, *nudge)
 	if err != nil {
 		return err
 	}
@@ -37,10 +43,15 @@ func runRegister(args []string) error {
 	fmt.Printf("export HIVE_TOKEN=%s\n", resp.Token)
 	how := "message-only (no pane bound)"
 	if *pane != "" {
-		how = "controllable + nudgeable via pane " + *pane
+		how = "controllable via pane " + *pane + "; automatic wake disabled"
+	}
+	if *nudge {
+		how = "controllable + automatic terminal wake enabled via pane " + *pane
 	}
 	fmt.Fprintf(os.Stderr, "hive: registered %s — %s\n", resp.Agent, how)
-	fmt.Fprintf(os.Stderr, "hive: apply with: eval \"$(hive register --name %s)\"\n", *name)
+	if *nudge {
+		fmt.Fprintln(os.Stderr, "hive: warning: --nudge may submit text typed after the idle check; use only for controlled idle panes")
+	}
 	return nil
 }
 

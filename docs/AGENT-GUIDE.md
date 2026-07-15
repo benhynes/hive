@@ -6,7 +6,8 @@ safe to paste into a system prompt or CLAUDE.md.
 
 ## Setup
 
-If you were spawned by hive, your identity is already in your environment:
+If you were started by `hive spawn` or `hive run`, your identity is already in
+your environment:
 
 ```
 HIVE_ADDR   your hub, e.g. http://127.0.0.1:7777
@@ -17,28 +18,55 @@ HIVE_CONTROL_TOKEN   only if you were trusted with control
 HIVE_CONTROL_HOST    only when that control token is bound to one host
 ```
 
-Register the MCP server once — it reads those env vars, so there is nothing
-else to configure:
+Configure the MCP server once in your runtime:
 
 ```sh
-claude mcp add hive -- hive mcp     # once, per agent
-hive mcp --list                     # what you'd be offered, without starting
+claude mcp add hive -- hive mcp     # once at the scope you want
+hive mcp --list                     # offered tools; no daemon contact
 ```
 
-Not spawned by hive (no `HIVE_*` in your env)? Get an identity first with
-`eval "$(hive register --name me)"`, then add the server. Names are lowercase
-`[a-z0-9_-]`, unique per host.
+No `HIVE_*` in your environment? `hive mcp` lazily registers a generated,
+message-only identity in the background when the runtime starts it. Its MCP
+handshake is available immediately; if the hub is down or a requested name is
+still live, enrollment retries in the background. A tool call also attempts
+enrollment and returns a retryable enrollment error rather than running under
+the bootstrap credential if the hub is still unavailable. This path does not
+need tmux. It needs either a local network with an MSG credential or explicit
+`HIVE_ADDR`, `HIVE_NET`, and MSG `HIVE_TOKEN` variables. Call `hive_agents` to
+find the authoritative assigned address in its top-level `self` field.
+
+Managed identities use a 60-second lease renewed every 15 seconds. The default
+generated identity is disposable: clean exit removes it and its mailbox. After
+a crash it disappears from discovery at lease expiry, remains recoverable by
+the same token for up to 24 hours (covering suspend or a partition), and is then
+pruned with its mailbox. Use `hive mcp --name me` when other agents need a
+stable address: a named sidecar releases presence on clean exit but retains the
+address and durable mailbox for offline delivery. A named replacement can
+reclaim immediately after a clean release; after a crash it may need to wait
+for the 60-second lease to expire.
+
+Tmux is optional terminal control, not enrollment. To adopt a pane deliberately,
+hold CONTROL and run this inside it:
+
+```sh
+eval "$(hive register --name me --pane "$TMUX_PANE")"
+```
+
+Add `--nudge` only if Hive may press Enter in that controlled idle pane. Hive
+never infers `$TMUX_PANE`; omit `--pane` for message-only manual registration.
+On Windows, manual `--pane` binding is unsupported: `--pid` provides liveness
+only, while console control applies to Hive-spawned sessions.
 
 > There is no `hive send` / `hive recv` / `hive ask` command — messaging is
 > the tools below, not the shell. (`hive` still exists for a human to run the
-> hub and drive the mesh by hand: `daemon`, `net`, `node`, `register`,
-> `spawn`, `read`, `keys`, `kill`.)
+> hub and drive the mesh by hand: `daemon`, `net`, `node`, `register`, `run`,
+> `deregister`, `agents`, `hosts`, `spawn`, `read`, `keys`, `kill`.)
 
 ## Talking (MSG layer — everyone has this)
 
 | tool | does |
 |---|---|
-| `hive_agents` | `{local_only?}` — who's on the mesh, who's alive |
+| `hive_agents` | `{local_only?}` — your address in `self`, plus the mesh roster and current presence |
 | `hive_send` | `{to, body}` — durable message; `to` is `name@host`, a bare name on your host, or `@all` |
 | `hive_recv` | `{wait?, max?, peek?}` — read new mail; **acks what it returns** |
 | `hive_ask` | `{to, question, timeout?}` — blocks until they answer; returns the answer text |
@@ -51,12 +79,14 @@ Rules of the road:
   model. The quickest way to get a message is to already be waiting for it:
   call `hive_recv` with `wait` (up to 25 s) in a loop, and mail comes back as
   the tool result the instant it's sent — sub-millisecond, no nudge involved.
-- **Otherwise you'll be nudged.** If mail lands while you're busy, the hub
-  types a line into your terminal like
-  `hive: alice@mac says: the build is green  (+2 more — hive_recv)`. It
-  carries a preview of the oldest unread message so you can often act right
-  away; call `hive_recv` for the full body and anything else waiting. A nudge
-  for a blocking question reads `... asks: ...` — handle those first.
+- **Automatic terminal wake is explicit opt-in.** If the identity was spawned
+  or pane-registered with `--nudge` and is not long-polling, the hub submits the fixed,
+  shell-inert notice `# hive: unread messages waiting - call the hive_recv
+  tool`. Peer-supplied message text is never typed into the terminal. The hub
+  checks for a recognized empty prompt first, but capture and Enter cannot be
+  atomic: a concurrently typed draft can still be submitted. Use this only for
+  controlled idle panes. Pane binding by itself does not opt in; every other
+  agent receives durable mail safely the next time it calls `hive_recv`.
 - **Answer asks promptly.** Someone is blocked waiting on you. `hive_asks`
   lists recent asks (including already-answered ones — answer each `ask_id`
   once). `hive_recv` also returns each ask with its `ask_id`.
@@ -73,7 +103,7 @@ control and there's no point trying — ask a controller via `hive_send`.
 
 | tool | does |
 |---|---|
-| `hive_spawn` | `{name, cmd[], host?, cwd?, grant_control?, wait_ready?, headed?, persist?}` — new tmux'd agent |
+| `hive_spawn` | `{name, cmd[], host?, cwd?, grant_control?, wait_ready?, headed?, nudge?, persist?}` — new managed session (tmux on Unix, console on Windows); `nudge` has the terminal-input caveat above |
 | `hive_keys` | `{agent, text, enter?}` — type into an agent's terminal |
 | `hive_read` | `{agent, lines?}` — its screen, as text |
 | `hive_kill` | `{agent, forget?}` — kill session + deregister |
@@ -119,7 +149,7 @@ answer = hive_ask{to: "architect@mac", question: "sync or async for the queue?",
 
 | message | meaning |
 |---|---|
-| `undeliverable: no such agent` | wrong name, or it deregistered |
+| `undeliverable: no such agent` | wrong name, or a disposable/generated identity has gone away |
 | `undeliverable: unknown host X` | this hub's hosts list lacks X (a human adds it with `hive hosts add`) |
 | `unreachable: ...` | host known but its hub is down |
 | `control token required` | you're MSG-only — you don't hold control |

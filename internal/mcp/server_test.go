@@ -33,8 +33,12 @@ func echoTools(gate chan struct{}) []Tool {
 			Description: "block until released",
 			Schema:      schema(`{"type":"object"}`),
 			Fn: func(ctx context.Context, args json.RawMessage) (string, error) {
-				<-gate
-				return "released", nil
+				select {
+				case <-gate:
+					return "released", nil
+				case <-ctx.Done():
+					return "", ctx.Err()
+				}
 			},
 		},
 	}
@@ -198,6 +202,82 @@ func TestBlockingToolDoesNotStallTheSession(t *testing.T) {
 	mu.Unlock()
 	if !strings.Contains(got, "released") {
 		t.Fatalf("blocked tool never completed: %s", got)
+	}
+}
+
+func TestServeStdioCancelsToolsAtEOF(t *testing.T) {
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	s := NewServer("hive", "1", []Tool{{
+		Name: "block", Schema: schema(`{"type":"object"}`),
+		Fn: func(ctx context.Context, args json.RawMessage) (string, error) {
+			close(started)
+			<-ctx.Done()
+			close(cancelled)
+			return "", ctx.Err()
+		},
+	}})
+	pr, pw := io.Pipe()
+	done := make(chan error, 1)
+	go func() { done <- s.ServeStdio(context.Background(), pr, io.Discard) }()
+	if _, err := io.WriteString(pw, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"block","arguments":{}}}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("tool never started")
+	}
+	if err := pw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ServeStdio did not return after EOF")
+	}
+	select {
+	case <-cancelled:
+	default:
+		t.Fatal("EOF did not cancel the in-flight tool")
+	}
+}
+
+func TestServeStdioDoesNotHangOnBlockedOutput(t *testing.T) {
+	for _, input := range []string{
+		`{"jsonrpc":"2.0","id":1,"method":"ping"}` + "\n",
+		`{not-json` + "\n",
+	} {
+		writerStarted := make(chan struct{})
+		releaseWriter := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			done <- NewServer("hive", "1", nil).ServeStdio(
+				context.Background(), strings.NewReader(input),
+				writerFunc(func(p []byte) (int, error) {
+					close(writerStarted)
+					<-releaseWriter
+					return len(p), nil
+				}),
+			)
+		}()
+		select {
+		case <-writerStarted:
+		case <-time.After(time.Second):
+			t.Fatal("response never reached the blocking writer")
+		}
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(handlerShutdownGrace + time.Second):
+			t.Fatal("ServeStdio waited indefinitely for a blocked response writer")
+		}
+		close(releaseWriter)
 	}
 }
 

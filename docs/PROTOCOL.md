@@ -39,7 +39,10 @@ hub's token with this form. The MSG token remains shared for routing.
 |---|---|
 | `GET  /v1/health` | none |
 | `GET  /metrics` | none; aggregate counts only |
-| `POST /v1/nets/{net}/register` | network token (msg or control) |
+| `POST /v1/nets/{net}/register` | network token; canonical for pane-less/PID registration; legacy pane compatibility requires control |
+| `POST /v1/nets/{net}/register/v2` | network token; a non-empty `pane` additionally requires control; safe explicit-nudge boundary |
+| `POST /v1/nets/{net}/heartbeat` | agent token (own registration only) |
+| `POST /v1/nets/{net}/release` | agent token (own retained lease only) |
 | `POST /v1/nets/{net}/deregister` | any (self), control (others) |
 | `GET  /v1/nets/{net}/agents` | any valid token |
 | `POST /v1/nets/{net}/send` | any valid token |
@@ -49,7 +52,8 @@ hub's token with this form. The MSG token remains shared for routing.
 | `GET  /v1/nets/{net}/hosts` | any valid token |
 | `POST /v1/nets/{net}/hosts` | control |
 | `POST /v1/nets/{net}/control/rotate` | control |
-| `POST /v1/nets/{net}/spawn` | control |
+| `POST /v1/nets/{net}/spawn/v2` | control; safe explicit-nudge boundary |
+| `POST /v1/nets/{net}/spawn` | control; legacy compatibility only |
 | `POST /v1/nets/{net}/keys` | control |
 | `GET  /v1/nets/{net}/read` | control |
 | `POST /v1/nets/{net}/kill` | control |
@@ -102,8 +106,18 @@ bodies are capped at 64 KiB.
 ## Endpoints
 
 ### `GET /v1/health`
-→ `{"api":"hive","v":1,"host":"mac"}`. Unauthenticated; used by
-`net join` to learn a peer's host name.
+→ `{"api":"hive","v":1,"host":"mac","features":["leases","ephemeral_registration","release_presence","explicit_nudge","versioned_pane_mutations"]}`.
+Unauthenticated; used by `net join` to learn a peer's host name and by clients
+to preflight semantics that cannot safely be negotiated after mutation.
+`leases`, `ephemeral_registration`, and `release_presence` advertise the three
+managed-identity lifecycle pieces described below. `explicit_nudge` means pane
+binding never implies terminal input and every nudge is an explicit request;
+new clients require it before any pane-bound register or spawn, including
+`nudge: false`. `versioned_pane_mutations` advertises `/register/v2` and
+`/spawn/v2`. Those paths give an atomic compatibility boundary: a daemon too
+old to understand explicit nudging returns 404 instead of performing a legacy
+mutation. Upgrade/restart the target daemon before upgrading control clients
+during a rolling deployment.
 
 ### `GET /metrics`
 Prometheus text exposition with aggregate daemon, network, agent-liveness,
@@ -112,15 +126,67 @@ gauges. It is
 unauthenticated so a read-only collector never holds Hive control, and it
 never includes agent names, tokens, addresses, messages, prompts, or panes.
 
-### `POST /register` `{name, pane?, pid?}`
-Binds identity for liveness: with `pane` (the caller's `$TMUX_PANE` on
-Unix, or `win:<pid>[:<creation>]` on Windows) the hub verifies the pane,
-captures its root pid and the process start-epoch (`ps lstart` on Unix,
-the process creation FILETIME on Windows) — the epoch check defeats pid
-reuse. With neither, the agent is message-only and trusted until
-deregistered.
+### `POST /register` and `POST /register/v2` `{name, pane?, nudge?, pid?, lease_seconds?, ephemeral?}`
+
+Binds identity for liveness. Current clients use `/register` for message-only
+or PID-bound enrollment and `/register/v2` whenever `pane` is non-empty. The
+unversioned pane mutation remains only for compatibility with older clients.
+
+On Unix, a client-supplied `pane` is an explicit tmux pane id such as
+`$TMUX_PANE`. The hub verifies it, captures its root pid, and records the
+process start epoch (`ps lstart`) to defeat pid reuse. Because a pane lets Hive
+inject terminal input through control APIs, binding one requires CONTROL even
+though pane-less registration needs only the network MSG token. It does not
+enable automatic input: `nudge: true` is a separate opt-in, requires `pane`,
+and is false by default. Windows clients cannot supply a controllable pane;
+they may use `pid` for liveness only. Opaque `win:<pid>:<creation>` bindings
+are created internally for sessions spawned by the Windows hub.
+
+With neither pane nor pid, the agent is message-only. A positive
+`lease_seconds` makes its presence renewable; zero preserves the legacy
+trusted-until-deregistered behavior. Lease duration is capped at one hour.
+`ephemeral: true` requires a positive lease and marks a generated, disposable
+identity; explicitly named clients leave it false. Hive's managed clients use a
+60-second lease and heartbeat every 15 seconds. Clean deregistration removes an
+ephemeral identity and mailbox immediately. After an unclean exit it disappears
+from discovery at lease expiry, but its token and mailbox remain recoverable
+for up to 24 hours before retirement. A new claimant may reclaim the generated
+name during that window; mailbox retirement completes before it becomes
+reusable, and stale in-memory readers cannot recreate its files.
 Rejects (409) names taken by a live agent; dead registrations are
-reclaimed. → `{agent, token}` (the per-agent token; shown once).
+reclaimed. → `{agent, token, nudge?, nudge_policy, lease_seconds?, lease_expires?, ephemeral?}` (the
+per-agent token is shown once; timestamps are Unix milliseconds). The response
+echoes `ephemeral: true` so clients can detect daemons that predate disposable
+registration support. A pane-bound client first requires the
+`explicit_nudge` health feature, calls `/register/v2`, then verifies
+`nudge_policy: "explicit"` and the echoed value in this response. If response
+verification fails it deregisters the just-minted identity. The versioned path,
+not the read-only preflight alone, prevents an older daemon from mutating a pane
+before incompatibility is discovered.
+
+### `POST /heartbeat`
+Renews the caller's own registration from the current time using the duration
+chosen at registration. Only the minted per-agent token can heartbeat; network
+credentials cannot assert an agent's presence. For an unleased legacy
+registration this is an accepted no-op.
+→ `{agent, lease_seconds?, lease_expires?}`.
+
+### `POST /release`
+Marks the caller's retained, leased identity offline immediately without
+deleting its address or durable mailbox. Only that identity's minted agent
+token may release it; ephemeral and unleased registrations are rejected. A
+subsequent claimant may reuse the now-dead name and receives the queued mail.
+This is the clean-exit path for explicitly named `hive mcp` and `hive run`
+sessions.
+→ `{agent, lease_seconds, lease_expires}`.
+
+### `GET /agents?local=1`
+Returns `{self?, agents, unreachable?}`. For an agent credential, `self` is
+derived from the authenticated token rather than client-supplied state. Each
+roster entry includes `agent`, `alive`, `controllable`, `nudgeable`, timestamps,
+and optional `ephemeral`/`spawned` flags. `local=1` skips peer
+fan-out. Offline named identities remain discoverable for durable delivery;
+expired ephemeral identities do not.
 
 ### `POST /send` `{to, kind?, body, corr_id?}`
 Builds the envelope (stamping `from`, minting `id`, `ts`), delivers
@@ -155,18 +221,27 @@ name. The `net.json` write completes before in-memory authentication
 switches; after success the old token is rejected. The CLI mints the
 token and warns that peers must be rotated separately.
 
-### `POST /spawn` `{name, cmd[], cwd?, grant_control?, wait_ready?, headed?}`
-Creates tmux session `hive-<net>-<name>` via `new-session -d -e ...`
-(env injected by tmux, never shell-interpolated), registers the agent
-bound to its pane, and injects `HIVE_ADDR/HIVE_NET/HIVE_AGENT/
-HIVE_TOKEN` (+ `HIVE_CONTROL_TOKEN` with `grant_control`, and
-`HIVE_CONTROL_HOST` when that token is host-local).
+### `POST /spawn/v2` `{name, cmd[], cwd?, grant_control?, wait_ready?, headed?, nudge?, persist?}`
+
+Creates a managed terminal session, registers the agent bound to its opaque
+pane handle, and injects `HIVE_ADDR/HIVE_NET/HIVE_AGENT/HIVE_TOKEN` (+
+`HIVE_CONTROL_TOKEN` with `grant_control`, and `HIVE_CONTROL_HOST` when that
+token is host-local). Unix uses tmux session `hive-<net>-<name>` with
+`new-session -d -e ...` (environment values are never shell-interpolated);
+Windows uses the console backend.
+
+Current clients require the `explicit_nudge` health feature and call
+`/spawn/v2`. The unversioned `/spawn` route remains for old-client wire
+compatibility only. Before mutating a persistent live declaration, the server
+rejects a request whose nudge policy differs from the existing session.
 `wait_ready` polls until the pane stops changing (≤15 s). `headed`
 opens a visible terminal window on the target host attached to the
 session (Terminal.app on macOS; `$TERMINAL` or a common emulator on
 Linux) — best-effort: it needs the daemon to run inside a GUI session,
 and failure never fails the spawn.
-→ `{agent, session, pane, ready, window?}` — `window` is `"opened"` or
+`nudge: true` separately opts this pane into automatic terminal wake and is
+persisted with persistent spawn declarations.
+→ `{agent, session, pane, nudge?, nudge_policy, ready, window?}` — `window` is `"opened"` or
 the error when `headed` was requested.
 
 ### `POST /keys` `{agent, text, enter?}`
@@ -177,7 +252,7 @@ bracketed `paste-buffer` for multi-line. `enter` presses Enter after.
 → `{agent, screen}` — `capture-pane` output; `lines` adds scrollback.
 
 ### `POST /kill` `{agent}`
-Kills the spawned tmux session (if any) and deregisters.
+Kills the spawned managed session (if any) and deregisters.
 → `{killed, deregistered}`.
 
 ## Ask/answer
@@ -191,15 +266,18 @@ sends `kind=answer` back to its `from`.
 
 ## Nudge
 
-When fresh mail lands for an idle tmux-bound agent (no live long-poll on
-its inbox), the hub types one line into its pane, e.g.
-`hive: alice@mac says: the build is green  (+2 more — hive_recv)`. The line
-carries the sender and a **single-line, length-capped preview** (≤240
-bytes) of the oldest unread body, so the agent can often act without a
-`recv` round trip; the full body still arrives via `recv`. `ask` mail is
-flagged `asks:` rather than `says:`. The preview is whitespace-folded to
-one line — a raw newline is never injected, since it would submit early in
-a TUI.
+Automatic terminal wake is off by default, including for pane-bound and spawned
+agents. When an agent is explicitly registered or spawned with `nudge: true`,
+and fresh mail lands while it is idle (no live long-poll on its inbox), the hub
+types and submits one fixed, shell-inert line:
+`# hive: unread messages waiting - call the hive_recv tool`. The notice accepts
+no envelope input: neither sender names nor peer-supplied message bodies are
+typed into the terminal. Full mail remains available through `recv`.
+
+This opt-in presses Enter. The hub captures the pane and proceeds only for a
+small set of recognized empty prompts, but that check cannot be atomic with
+terminal input: text typed concurrently can be submitted. Use automatic wake
+only for controlled idle panes. Long-polling `recv` is the safe default.
 
 Re-arming is keyed on the inbox's latest seq, not a wall-clock window: an
 agent is nudged when mail arrives past what it was last nudged about,
@@ -210,30 +288,45 @@ anti-burst floor is still announced promptly. (Earlier versions nudged
 only as a side effect of delivery, so a message arriving in the quiet
 window with no later traffic could go unannounced indefinitely.)
 
-The preview means a message body — sender-supplied bytes — is typed into a
-recipient's pane. This is deliberate and within the trust model: mesh
-members are trusted, `from` is authenticated, and any control-holder can
-already type arbitrary text into any pane. It is a weaker capability than
-CONTROL keys, but it is a real change from the previous "bodies are never
-injected" rule. Agents are assumed to be TUI agents where typed text is a
-prompt, not a shell that would execute it.
-
 ## Liveness
 
 An agent is *alive* while its bound pane exists and its pid still has
-the recorded start-epoch. Dead agents stay listed (`alive: false`)
-until deregistered, killed, or their name is reclaimed by a new
-registration.
+the recorded start-epoch. A leased registration must also have a future
+`lease_expires`; heartbeats move that deadline. Legacy unbound registrations
+retain their trusted-until-deregistered behavior for compatibility.
+
+An expired ephemeral registration is omitted from discovery immediately. Its
+token can still heartbeat and recover the same identity during a bounded
+24-hour grace period (unless another claimant first reuses the name); after the
+grace, the lifecycle sweep retires both record and disposable mailbox. Other
+dead or expired agents stay listed (`alive: false`) until deregistered, killed,
+renewed, or their name is reclaimed. In particular, `/release` makes a named
+managed identity visibly offline at once while preserving its address and
+mailbox for durable delivery.
 
 ## MCP
 
 `hive mcp` (see the agent guide) is a **client-side surface, not part of
 this wire protocol.** It is a stdio MCP server that speaks JSON-RPC 2.0
-to the agent and plain `/v1` HTTP to the hub, exactly as the CLI does —
-the hub is unchanged and unaware. Permission layers therefore hold
-without any new enforcement: the MCP server holds only the credentials in
-its environment, and CONTROL tools are omitted from `tools/list` entirely
-when it holds no control token.
+to the agent and plain `/v1` HTTP to the hub, exactly as the CLI does. With an
+injected `HIVE_AGENT`/`HIVE_TOKEN` pair it uses that identity. Without one it
+starts the MCP protocol immediately, then uses either the locally configured
+network MSG credential or an explicit `HIVE_ADDR`/`HIVE_NET`/MSG `HIVE_TOKEN`
+to enroll lazily in the background. Enrollment retries every five seconds
+while stdio remains open; each Hive tool call also attempts enrollment and
+returns an enrollment error if it still cannot succeed. Once minted, the
+per-agent token replaces the bootstrap credential before the tool operation
+runs, so calls cannot fall through as network-token `human`.
+
+The sidecar heartbeats its 60-second lease every 15 seconds. On clean exit, a
+generated name deregisters and retires its disposable mailbox; an explicit
+`--name` calls `/release`, immediately marking presence false while keeping the
+named mailbox. Injected identities remain owned by the launcher and are not
+cleaned up by the MCP subprocess.
+
+Agent-mode credential resolution never inherits CONTROL from `net.json`; a
+control credential must be explicitly supplied in `HIVE_CONTROL_TOKEN`.
+CONTROL tools are omitted from `tools/list` entirely when it is absent.
 
 `internal/mcp` keeps the protocol (`Server.Handle`) separate from the
 framing (`ServeStdio`), so serving MCP from the hub over HTTP would add a
@@ -242,7 +335,10 @@ endpoint does not exist today.
 
 ## Durability
 
-Inboxes are append-only JSONL (`~/.hive/nets/<net>/inbox/<name>.jsonl`)
-with a separate cursor file — restarts lose nothing, re-reads are
-idempotent. Files compact once they double the 1000-message retained
-window. Registry and tokens live in `registry.json` (hashes only).
+Retained named inboxes are append-only JSONL
+(`~/.hive/nets/<net>/inbox/<name>.jsonl`) with a separate cursor file —
+restarts lose nothing and re-reads are idempotent. Generated ephemeral inboxes
+use the same format while live and during the post-expiry recovery window, but
+are deleted on clean deregistration, name reuse, or final prune. Files compact
+once they double the 1000-message retained window. Registry and tokens live in
+`registry.json` (hashes only).

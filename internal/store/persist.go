@@ -14,6 +14,7 @@ type PersistSpec struct {
 	Cmd          []string `json:"cmd"`
 	Cwd          string   `json:"cwd,omitempty"`
 	GrantControl bool     `json:"grant_control,omitempty"`
+	Nudge        bool     `json:"nudge,omitempty"`
 	Declared     int64    `json:"declared"` // unix milliseconds
 }
 

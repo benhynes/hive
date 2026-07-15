@@ -23,7 +23,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/benhynes/hive/internal/config"
 	"github.com/benhynes/hive/internal/control"
@@ -42,9 +41,15 @@ const (
 	// catches mail that arrived inside nudgeMinGap and was never followed by
 	// another delivery — the case that used to stall unbounded.
 	nudgeSweepEvery = 3 * time.Second
-	// nudgePreviewMax caps how many bytes of a message body are typed into a
-	// pane. The full body still comes via recv; this is just enough to act on.
-	nudgePreviewMax = 240
+	// Generated identities disappear from discovery at lease expiry, but their
+	// token/mailbox get a bounded recovery window for partitions and suspend
+	// before irreversible retirement.
+	ephemeralRetention = 24 * time.Hour
+	// nudgeNotice is deliberately fixed and starts with a shell comment. A
+	// peer can trigger a wake-up by sending mail, but cannot choose any bytes
+	// typed into the pane; if the agent has exited back to a shell, Enter runs
+	// an inert comment rather than a command.
+	nudgeNotice = "# hive: unread messages waiting - call the hive_recv tool"
 )
 
 // Hub is one host's daemon state.
@@ -54,6 +59,11 @@ type Hub struct {
 	nets   map[string]*network
 	client *http.Client // hub->hub calls
 	ssh    *sshManager  // on-demand SSH hosts (transient remote daemons over tunnels)
+
+	// killSessionFn is the control-backend seam used by hKill. Production
+	// falls back to control.KillSession; tests replace it to hold teardown at a
+	// deterministic point while a dead name is reclaimed.
+	killSessionFn func(session, pane string) error
 }
 
 type network struct {
@@ -150,6 +160,22 @@ func (n *network) inbox(agent string) (*store.Inbox, error) {
 	return ib, nil
 }
 
+// retireInbox removes a disposable identity's mailbox from memory and disk.
+// The caller holds regMu, which excludes every production path that can open,
+// append, or ack an inbox while the name is being made reusable.
+func (n *network) retireInbox(agent string) error {
+	n.mu.Lock()
+	ib := n.inboxes[agent]
+	delete(n.inboxes, agent)
+	delete(n.lastNudge, agent)
+	delete(n.lastNudgedLatest, agent)
+	n.mu.Unlock()
+	if ib != nil {
+		return ib.Retire()
+	}
+	return store.RemoveInbox(n.dir, agent)
+}
+
 func (n *network) hosts() map[string]string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -169,9 +195,10 @@ func (n *network) auditLine(actor, action, target, detail string) {
 
 // ident is the resolved authentication result for a request.
 type ident struct {
-	Control bool   // holds this hub's accepted control token
-	NetTok  bool   // holds a network token (msg or control)
-	Agent   string // agent name when an agent token was presented
+	Control   bool   // holds this hub's accepted control token
+	NetTok    bool   // holds a network token (msg or control)
+	Agent     string // agent name when an agent token was presented
+	TokenHash string // exact agent-token generation resolved for this request
 }
 
 // resolve maps a bearer token to an identity within a network.
@@ -194,9 +221,28 @@ func (n *network) resolve(tok, host string) (ident, bool) {
 		return ident{NetTok: true}, true
 	}
 	if rec, ok := n.reg.ByToken(h); ok {
-		return ident{Agent: rec.Name}, true
+		return ident{Agent: rec.Name, TokenHash: h}, true
 	}
 	return ident{}, false
+}
+
+// ownsRegistration reports whether an agent-authenticated request still owns
+// the exact registration generation it resolved to. Agent names are reusable:
+// a token resolving before a long poll or slow request must not authorize work
+// against a later claimant of the same name.
+func (n *network) ownsRegistration(id ident, name string) bool {
+	if id.Agent == "" || id.Agent != name || id.TokenHash == "" {
+		return false
+	}
+	rec, ok := n.reg.Get(name)
+	return ok && rec.TokenHash == id.TokenHash
+}
+
+func (h *Hub) killSession(session, pane string) error {
+	if h.killSessionFn != nil {
+		return h.killSessionFn(session, pane)
+	}
+	return control.KillSession(session, pane)
 }
 
 // from returns the stamped sender identity for a request.
@@ -207,8 +253,32 @@ func (h *Hub) from(id ident) string {
 	return "human@" + h.Cfg.HostName
 }
 
+// leaseExpiredAt reports only renewable-presence expiry. Legacy records have
+// no lease fields and therefore never expire through this path.
+func leaseExpiredAt(rec store.AgentRec, now time.Time) bool {
+	if rec.LeaseSeconds <= 0 && rec.LeaseExpires <= 0 {
+		return false
+	}
+	return rec.LeaseExpires <= 0 || now.UnixMilli() >= rec.LeaseExpires
+}
+
+// discoverableAt keeps an expired generated identity out of rosters while its
+// token and mailbox remain recoverable during the bounded retirement grace.
+// A successful heartbeat extends its lease and makes it discoverable again.
+func discoverableAt(rec store.AgentRec, now time.Time) bool {
+	return !rec.Ephemeral || !leaseExpiredAt(rec, now)
+}
+
 // alive probes whether a registered agent is still what it was bound to.
-func alive(rec store.AgentRec) bool {
+func alive(rec store.AgentRec) bool { return aliveAt(rec, time.Now()) }
+
+func aliveAt(rec store.AgentRec, now time.Time) bool {
+	// A lease is an additional liveness condition, not a replacement for a
+	// pane/PID binding. Legacy records have a zero expiry and retain their old
+	// trusted-until-deregistered behavior when otherwise unbound.
+	if leaseExpiredAt(rec, now) {
+		return false
+	}
 	if rec.Pane != "" && !control.PaneExists(rec.Pane) {
 		return false
 	}
@@ -222,15 +292,19 @@ func alive(rec store.AgentRec) bool {
 // deliverLocal appends an envelope to a local agent's inbox and fires the
 // nudge engine. Fresh reports whether it was not a duplicate.
 func (h *Hub) deliverLocal(n *network, agent string, env proto.Envelope) error {
+	n.regMu.Lock()
 	rec, ok := n.reg.Get(agent)
 	if !ok {
+		n.regMu.Unlock()
 		return fmt.Errorf("no such agent")
 	}
 	ib, err := n.inbox(agent)
 	if err != nil {
+		n.regMu.Unlock()
 		return err
 	}
 	_, fresh, err := ib.Append(env)
+	n.regMu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -248,13 +322,13 @@ func (h *Hub) maybeNudge(n *network, rec store.AgentRec, ib *store.Inbox) {
 	h.nudge(n, rec, ib)
 }
 
-// nudge injects a hint (and a preview of the waiting mail) into an idle
-// agent's pane. It is the single choke point for both the delivery path and
-// the sweeper, so per-agent rate limiting is consistent across them.
+// nudge injects a fixed, shell-inert hint into an explicitly opted-in agent's
+// idle pane. It is the single choke point for both the delivery path and the
+// sweeper, so per-agent rate limiting is consistent across them.
 //
 // Gating, in order:
-//   - no pane, or the agent is actively long-polling its own inbox → the
-//     agent will see the mail itself; injecting would just race its TUI.
+//   - no explicit nudge opt-in, no pane, or the agent is actively long-polling
+//     its own inbox → never inject terminal input.
 //   - nothing unread → nothing to say.
 //   - within nudgeMinGap of the last nudge → coalesce a burst.
 //   - already nudged about this exact latest seq, and the reminder interval
@@ -265,7 +339,7 @@ func (h *Hub) maybeNudge(n *network, rec store.AgentRec, ib *store.Inbox) {
 // is announced on the next sweep instead of being lost until some unrelated
 // later delivery happened to re-trigger the code path.
 func (h *Hub) nudge(n *network, rec store.AgentRec, ib *store.Inbox) {
-	if rec.Pane == "" || ib.Pollers() > 0 {
+	if !rec.Nudge || rec.Pane == "" || ib.Pollers() > 0 {
 		return
 	}
 	lag := ib.Lag()
@@ -289,10 +363,31 @@ func (h *Hub) nudge(n *network, rec store.AgentRec, ib *store.Inbox) {
 	n.lastNudgedLatest[rec.Name] = latest
 	n.mu.Unlock()
 
-	line := nudgeLine(ib, lag)
+	line := nudgeLine()
 	pane := rec.Pane
 	go func() {
-		if !control.PaneExists(pane) {
+		// Serialize the final ownership check and terminal writes with register,
+		// deregister, spawn, and kill. Otherwise an already-queued Nudge=true
+		// job could type into a replacement registration that opted out while
+		// reusing the same pane.
+		n.regMu.Lock()
+		defer n.regMu.Unlock()
+		current, ok := n.reg.Get(rec.Name)
+		if !ok || current.TokenHash != rec.TokenHash || current.Pane != pane || !current.Nudge {
+			return
+		}
+		// Delivery may have queued this goroutine while the process was exiting
+		// or while the user/model was composing a draft. A conservatively
+		// recognized empty prompt is required as defense in depth; it cannot
+		// eliminate the capture-to-Enter race, which is why nudging is opt-in.
+		if !alive(current) {
+			return
+		}
+		screen, err := control.Capture(pane, 0)
+		if err != nil || !emptyPanePrompt(screen) {
+			return
+		}
+		if !alive(current) {
 			return
 		}
 		if control.SendKeysLiteral(pane, line) == nil {
@@ -301,49 +396,44 @@ func (h *Hub) nudge(n *network, rec store.AgentRec, ib *store.Inbox) {
 	}()
 }
 
-// nudgeLine builds the text typed into the pane: the oldest unread message's
-// sender and a preview of its body, so the agent can start acting without a
-// round trip through recv. Extra unread mail is summarized as a count.
-func nudgeLine(ib *store.Inbox, lag int64) string {
-	res := ib.Read(ib.Cursor(), 1)
-	if len(res.Msgs) == 0 {
-		// Raced with a compaction/ack; fall back to the pointer form.
-		return fmt.Sprintf("hive: %d new message(s) — call the hive_recv tool", lag)
-	}
-	e := res.Msgs[0].Env
-	kind := ""
-	if e.Kind == proto.KindAsk {
-		kind = "asks" // asks are blocking; flag them
-	} else {
-		kind = "says"
-	}
-	line := fmt.Sprintf("hive: %s %s: %s", e.From, kind, preview(e.Body))
-	if lag > 1 {
-		line += fmt.Sprintf("  (+%d more — hive_recv)", lag-1)
-	}
-	return line
-}
+// nudgeLine is a tiny seam for testing the only text automatic delivery is
+// allowed to type into a pane. It intentionally accepts no envelope data.
+func nudgeLine() string { return nudgeNotice }
 
-// preview collapses a body to a single, printable, length-capped line safe to
-// type into a pane. The full body is always still available via recv; this is
-// only enough to act on.
-func preview(body string) string {
-	// One line: a raw newline typed into a TUI would submit early or inject a
-	// stray Enter, so fold all whitespace runs to single spaces.
-	s := strings.Join(strings.Fields(body), " ")
-	if len(s) > nudgePreviewMax {
-		// Trim on a rune boundary, not mid-codepoint.
-		cut := nudgePreviewMax
-		for cut > 0 && !utf8.RuneStart(s[cut]) {
-			cut--
+// emptyPanePrompt recognizes only a small set of conventional empty prompts.
+// The final nonblank rendered line must be exactly the prompt glyph: a suffix,
+// draft, status line, or unknown TUI is rejected. False negatives merely defer
+// a nudge; false positives can submit user/model input, so stay conservative.
+func emptyPanePrompt(screen string) bool {
+	lines := strings.Split(screen, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
 		}
-		s = s[:cut] + "…"
+		switch line {
+		case "$", "#", "%", "❯", "›":
+			return true
+		default:
+			return false
+		}
 	}
-	return s
+	return false
 }
 
-// SweepNudges periodically re-checks every locally-registered, pane-bound
-// agent and re-nudges any that still hold unread mail. This is the re-arm
+// pruneExpiredEphemeral serializes removal with registration, heartbeat, and
+// deregistration ownership changes. The store method removes only disposable
+// generated identities; named expired records remain available for resume.
+func pruneExpiredEphemeral(n *network, now time.Time) ([]string, error) {
+	n.regMu.Lock()
+	defer n.regMu.Unlock()
+	return n.reg.PruneExpiredEphemeral(now, ephemeralRetention, n.retireInbox)
+}
+
+// SweepNudges periodically re-checks every locally-registered, opted-in,
+// pane-bound agent and re-nudges any that still hold unread mail. It also removes expired
+// generated identities so unclean exits do not permanently clutter discovery.
+// This is the re-arm
 // that turns the old unbounded stall (a message that arrived during the
 // anti-spam window and was never followed by another delivery) into one
 // bounded by nudgeReminderEvery. It shares the nudge choke point, so the
@@ -364,11 +454,21 @@ func (h *Hub) SweepNudges(ctx context.Context) {
 		}
 		h.mu.Unlock()
 		for _, n := range nets {
+			if _, err := pruneExpiredEphemeral(n, time.Now()); err != nil && n.audit != nil {
+				n.auditLine("daemon (sweep)", "prune", "ephemeral registrations", "error: "+err.Error())
+			}
 			for _, rec := range n.reg.List() {
-				if rec.Pane == "" {
+				if !rec.Nudge || rec.Pane == "" {
+					continue
+				}
+				n.regMu.Lock()
+				current, ok := n.reg.Get(rec.Name)
+				if !ok || current.TokenHash != rec.TokenHash {
+					n.regMu.Unlock()
 					continue
 				}
 				ib, err := n.inbox(rec.Name)
+				n.regMu.Unlock()
 				if err != nil {
 					continue
 				}
@@ -388,7 +488,11 @@ func (h *Hub) SweepNudges(ctx context.Context) {
 // broadcastLocal delivers to every local agent except the sender.
 func (h *Hub) broadcastLocal(n *network, env proto.Envelope, exceptFrom string) map[string]string {
 	res := map[string]string{}
+	now := time.Now()
 	for _, rec := range n.reg.List() {
+		if !discoverableAt(rec, now) {
+			continue
+		}
 		if rec.Name+"@"+h.Cfg.HostName == exceptFrom {
 			continue
 		}

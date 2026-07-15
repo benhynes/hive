@@ -22,7 +22,9 @@ import (
 	"time"
 )
 
-const tmuxSocket = "hive-e2e"
+// Every test binary gets its own tmux server. A fixed name lets concurrent
+// `go test` invocations kill each other's panes during cleanup.
+var tmuxSocket = fmt.Sprintf("hive-e2e-%d", os.Getpid())
 
 var (
 	buildOnce sync.Once
@@ -412,11 +414,11 @@ func TestEndToEnd(t *testing.T) {
 
 	// ---- control across hubs: spawn/keys/read/kill on B, driven from A ----
 	t.Run("cross-hub-control", func(t *testing.T) {
-		out := mustCLI(t, a.env(), "spawn", "--host", "hostb", "--wait", "worker", "--", "cat")
+		out := mustCLI(t, a.env(), "spawn", "--host", "hostb", "--wait", "--nudge", "worker", "--", "sh")
 		if !strings.Contains(out, "spawned worker@hostb") {
 			t.Fatalf("spawn: %q", out)
 		}
-		mustCLI(t, a.env(), "keys", "--enter", "worker@hostb", "hello from hosta")
+		mustCLI(t, a.env(), "keys", "--enter", "worker@hostb", "printf 'hello from hosta\\n'")
 		screen := ""
 		deadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(deadline) {
@@ -435,20 +437,23 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("spawned agent not in mesh listing:\n%s", out)
 		}
 
-		// New mail nudges the idle pane, carrying the sender and a body
-		// preview so the agent can act without a recv round trip.
+		// New mail nudges this explicitly opted-in idle pane with a fixed notice.
+		// Peer-controlled sender/body text must never be injected as terminal input.
 		apiSend(t, alice, "worker@hostb", "you have mail")
 		deadline = time.Now().Add(5 * time.Second)
 		nudged := false
 		for !nudged && time.Now().Before(deadline) {
 			screen = mustCLI(t, a.env(), "read", "worker@hostb")
-			nudged = strings.Contains(screen, "alice@hosta") && strings.Contains(screen, "you have mail")
+			nudged = strings.Contains(screen, "# hive: unread messages waiting - call the hive_recv tool")
 			if !nudged {
 				time.Sleep(100 * time.Millisecond)
 			}
 		}
 		if !nudged {
-			t.Fatalf("idle agent never nudged with sender + preview:\n%s", screen)
+			t.Fatalf("idle agent never received fixed mail notice:\n%s", screen)
+		}
+		if strings.Contains(screen, "alice@hosta") || strings.Contains(screen, "you have mail") {
+			t.Fatalf("nudge injected peer-controlled sender/body text:\n%s", screen)
 		}
 
 		out = mustCLI(t, a.env(), "kill", "worker@hostb")

@@ -17,6 +17,7 @@ func runSpawn(args []string) error {
 	grant := fs.Bool("grant-control", false, "inject this host's control token (CONTROL layer)")
 	waitReady := fs.Bool("wait", false, "wait until the pane draws and goes quiet")
 	headed := fs.Bool("headed", false, "open a visible terminal window on the target host attached to the session")
+	nudge := fs.Bool("nudge", false, "opt into automatic terminal wake + Enter (controlled idle panes only)")
 	persist := fs.Bool("persist", false, "declare the session: the daemon respawns it after reboot or crash")
 	fs.Parse2()
 	name := fs.pos(0)
@@ -24,13 +25,13 @@ func runSpawn(args []string) error {
 	// A profile may supply the runtime, so a bare `-- CMD` is optional when
 	// --profile is given; the hub enforces that at least one is present.
 	if name == "" || (len(cmd) == 0 && *profile == "") {
-		return fmt.Errorf("usage: hive spawn [--host H] [--cwd D] [--profile P] [--grant-control] [--wait] [--headed] [--persist] <name> -- CMD...")
+		return fmt.Errorf("usage: hive spawn [--host H] [--cwd D] [--profile P] [--grant-control] [--wait] [--headed] [--nudge] [--persist] <name> -- CMD...")
 	}
 	c, err := client.Resolve(*fs.net)
 	if err != nil {
 		return err
 	}
-	res, err := c.Spawn(*host, name, cmd, *cwd, *profile, *grant, *waitReady, *headed, *persist)
+	res, err := c.SpawnWithNudge(*host, name, cmd, *cwd, *profile, *grant, *waitReady, *headed, *nudge, *persist)
 	if err != nil {
 		return err
 	}
@@ -48,6 +49,9 @@ func runSpawn(args []string) error {
 	}
 	if *grant {
 		fmt.Printf("  control: granted (HIVE_CONTROL_TOKEN injected)\n")
+	}
+	if *nudge {
+		fmt.Printf("  nudge:   enabled (warning: a concurrent terminal draft can be submitted)\n")
 	}
 	if *persist {
 		fmt.Printf("  persist: declared (daemon respawns it after reboot/crash; remove with hive kill --forget)\n")

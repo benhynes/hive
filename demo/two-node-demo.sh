@@ -2,13 +2,13 @@
 # two-node-demo.sh — two hive hubs on one machine, full mesh tour.
 #
 # Simulates two hosts ("hosta", "hostb") with separate HIVE_HOME state
-# dirs, separate ports, and a dedicated tmux socket. Walks: net create/
-# join, register, MCP messaging (send/recv/ask/answer/broadcast),
-# spawn/keys/read, nudge, layer enforcement, kill, audit log. Messaging
-# is driven through `hive mcp` — the MCP tools are the agent interface;
-# there is no `hive send`/`recv` CLI. Cleans up after itself.
+# dirs, separate ports, and a dedicated tmux socket. Walks: net create/join,
+# lazy MCP enrollment without tmux, MCP messaging (send/recv/ask/answer/
+# broadcast), then optional managed spawn/keys/read/nudge/kill and audit. The
+# tmux worker demonstrates terminal control; messaging itself has no tmux
+# dependency and is driven through `hive mcp`.
 #
-# Needs: go, curl, tmux, python3.
+# Needs: go, curl, python3, and tmux for the managed-control half.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -34,21 +34,40 @@ run()  { printf '\033[36m$ %s\033[0m\n' "$*"; "$@"; }
 # spawned agent does: `hive mcp` is its stdio MCP server, reading its HIVE_*
 # env. Messaging has no CLI; these tools are the interface.
 rpc() {
+  local identity_fn=$1 tool=$2 args=$3 line result
+  local matched=0 rpc_status=0
+  coproc HIVE_MCP { "$identity_fn"; }
+  local in_fd=${HIVE_MCP[1]} out_fd=${HIVE_MCP[0]} mcp_pid=$HIVE_MCP_PID
+
   printf '%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}' \
-    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"$2\",\"arguments\":$3}}" \
-  | "$1" \
-  | python3 -c '
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}" \
+    >&"$in_fd"
+
+  # Keep stdin open until the tool result arrives. EOF owns the MCP session's
+  # cancellation boundary, so the old one-way pipeline correctly (but too
+  # early) cancelled its own in-flight HTTP request.
+  while IFS= read -r line <&"$out_fd"; do
+    if result=$(python3 -c '
 import sys, json
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    m = json.loads(line)
-    if m.get("id") == 2:
-        r = m["result"]
-        text = "".join(c.get("text", "") for c in r.get("content", []))
-        sys.stdout.write(("ERROR: " if r.get("isError") else "") + text + "\n")'
+m = json.loads(sys.stdin.read())
+if m.get("id") != 2:
+    raise SystemExit(1)
+r = m["result"]
+text = "".join(c.get("text", "") for c in r.get("content", []))
+sys.stdout.write(("ERROR: " if r.get("isError") else "") + text)' <<<"$line"); then
+      matched=1
+      printf '%s\n' "$result"
+      [[ $result != ERROR:* ]] || rpc_status=1
+      break
+    fi
+  done
+
+  exec {in_fd}>&-
+  wait "$mcp_pid" || rpc_status=1
+  exec {out_fd}>&-
+  (( matched == 1 )) || rpc_status=1
+  return "$rpc_status"
 }
 
 step "build"
@@ -85,25 +104,28 @@ run B net join dev --hub 127.0.0.1:$PORT_A --msg-token "$MSG_TOK" --control-toke
 run A hosts add hostb 127.0.0.1:$PORT_B
 run A hosts list
 
-step "register alice on hosta (message-only external agent)"
-REG=$(A register --name alice --pane "")
-echo "$REG"
-# act as alice: only her exports, no local net.json fallback
-alice()     { env HIVE_HOME=$ROOT/empty HIVE_TMUX_SOCKET=$HIVE_TMUX_SOCKET $(echo "$REG" | sed 's/^export //') "$BIN" "$@"; }
-alice_mcp() { alice mcp; }
+anonymous_mcp() { env HIVE_HOME=$ROOT/home-a HIVE_TMUX_SOCKET=$HIVE_TMUX_SOCKET "$BIN" mcp; }
+alice_mcp()     { env HIVE_HOME=$ROOT/home-a HIVE_TMUX_SOCKET=$HIVE_TMUX_SOCKET "$BIN" mcp --name alice; }
+alice_tools()   { env HIVE_HOME=$ROOT/home-a HIVE_TMUX_SOCKET=$HIVE_TMUX_SOCKET "$BIN" mcp --name alice --list; }
+
+step "MCP joins the mesh without tmux (generated disposable identity)"
+run rpc anonymous_mcp hive_agents '{}'
+
+step "choose stable MCP identity 'alice' (named mailbox survives offline)"
+run rpc alice_mcp hive_agents '{}'
 
 step "spawn 'worker' on hostb, driven from hosta (control goes direct)"
-run A spawn --host hostb --wait worker -- cat
+run A spawn --host hostb --wait --nudge worker -- sh
 
 step "mesh-wide discovery"
 run A agents
 
 step "type into worker's pane from hosta, read its screen back"
-run A keys --enter worker@hostb "hello from hosta"
+run A keys --enter worker@hostb "printf 'hello from hosta\\n'"
 sleep 0.4
 run A read worker@hostb
 
-step "alice sends mail via her hive_send tool; the idle pane gets nudged (with a preview)"
+step "alice sends mail via her hive_send tool; the opted-in idle pane gets a fixed nudge notice"
 run rpc alice_mcp hive_send '{"to":"worker@hostb","body":"psst — status report please"}'
 sleep 1.2
 run A read worker@hostb
@@ -134,9 +156,11 @@ step "broadcast from alice"
 run rpc alice_mcp hive_send '{"to":"@all","body":"stand-up in 5"}'
 run rpc worker_mcp hive_recv '{}'
 
-step "layer enforcement: alice (MSG) cannot control anyone"
-if alice read worker@hostb 2>&1; then
-  echo "UNEXPECTED: msg-layer agent controlled a pane"; exit 1
+step "layer enforcement: Alice's MSG-only MCP surface omits control tools"
+ALICE_TOOLS=$(alice_tools)
+printf '%s\n' "$ALICE_TOOLS"
+if printf '%s\n' "$ALICE_TOOLS" | grep -q '^hive_read$'; then
+  echo "UNEXPECTED: msg-layer MCP exposed a control tool"; exit 1
 fi
 
 step "kill worker from hosta"

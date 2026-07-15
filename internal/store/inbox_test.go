@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -165,5 +166,65 @@ func TestWaitTimeout(t *testing.T) {
 	res := ib.Wait(ctx, 0, 10)
 	if len(res.Msgs) != 0 {
 		t.Fatalf("expected empty, got %+v", res)
+	}
+}
+
+func TestRemoveInboxDeletesMessagesAndCursor(t *testing.T) {
+	dir := t.TempDir()
+	ib, err := OpenInbox(dir, "generated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := env("disposable", "disposable")
+	seq, _, err := ib.Append(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ib.Ack(seq); err != nil {
+		t.Fatal(err)
+	}
+	if err := ib.Retire(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ib.Append(env("late", "must not recreate")); !errors.Is(err, ErrInboxRetired) {
+		t.Fatalf("append through retired mailbox returned %v", err)
+	}
+	if err := ib.Ack(seq); !errors.Is(err, ErrInboxRetired) {
+		t.Fatalf("ack through retired mailbox returned %v", err)
+	}
+
+	reopened, err := OpenInbox(dir, "generated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.Read(0, 10); len(got.Msgs) != 0 || got.Cursor != 0 || got.Latest != 0 {
+		t.Fatalf("removed mailbox retained state: %+v", got)
+	}
+}
+
+func TestRetireWakesWaiters(t *testing.T) {
+	ib, err := OpenInbox(t.TempDir(), "generated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan ReadResult, 1)
+	go func() { done <- ib.Wait(context.Background(), 0, 10) }()
+	deadline := time.Now().Add(time.Second)
+	for ib.Pollers() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if ib.Pollers() != 1 {
+		t.Fatal("waiter did not block")
+	}
+	if err := ib.Retire(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case res := <-done:
+		if len(res.Msgs) != 0 || res.Latest != 0 {
+			t.Fatalf("retired waiter returned data: %+v", res)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retirement did not wake long poll")
 	}
 }

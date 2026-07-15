@@ -75,6 +75,39 @@ func registerHTTP(t *testing.T, srv *httptest.Server, nc config.NetConfig, name 
 	return out["token"].(string)
 }
 
+// MSG is enough to bootstrap message-only and PID-bound agents. Binding a pane
+// enables control, so it must cross the CONTROL boundary before the
+// platform-specific pane lookup is attempted. Automatic wake is a separate,
+// explicit opt-in and is invalid without a pane.
+func TestPaneRegistrationRequiresControl(t *testing.T) {
+	srv, nc := newTestNet(t)
+
+	if code, out := call(t, srv, "POST", "/v1/nets/dev/register", nc.MsgToken,
+		map[string]any{"name": "messageonly"}); code != 200 {
+		t.Fatalf("message-only MSG registration: want 200, got %d %v", code, out)
+	}
+	if code, out := call(t, srv, "POST", "/v1/nets/dev/register", nc.MsgToken,
+		map[string]any{"name": "pidbound", "pid": os.Getpid()}); code != 200 {
+		t.Fatalf("PID-bound MSG registration: want 200, got %d %v", code, out)
+	}
+	if code, out := call(t, srv, "POST", "/v1/nets/dev/register", nc.MsgToken,
+		map[string]any{"name": "nopane", "nudge": true}); code != 400 {
+		t.Fatalf("nudge without pane: want 400, got %d %v", code, out)
+	}
+
+	invalidPane := "%hive-security-test-does-not-exist"
+	if code, out := call(t, srv, "POST", "/v1/nets/dev/register", nc.MsgToken,
+		map[string]any{"name": "paneattacker", "pane": invalidPane, "nudge": true}); code != 403 {
+		t.Fatalf("pane-bound MSG registration: want 403, got %d %v", code, out)
+	}
+	// CONTROL gets past authorization and reaches pane validation. The target
+	// is intentionally nonexistent so this test needs no live tmux session.
+	if code, out := call(t, srv, "POST", "/v1/nets/dev/register", nc.ControlToken,
+		map[string]any{"name": "paneoperator", "pane": invalidPane}); code != 400 {
+		t.Fatalf("pane-bound CONTROL registration: want pane-validation 400, got %d %v", code, out)
+	}
+}
+
 func agentClient(t *testing.T, srv *httptest.Server, tok, control string) *client.Client {
 	t.Helper()
 	t.Setenv("HIVE_ADDR", srv.URL)

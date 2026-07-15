@@ -31,6 +31,30 @@ func healthOKURL(base string) bool {
 	return resp.StatusCode == 200
 }
 
+func requireHealthFeatureURL(base, feature string) error {
+	c := &http.Client{Timeout: 1500 * time.Millisecond}
+	resp, err := c.Get(base + "/v1/health")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("health: %s", resp.Status)
+	}
+	var health struct {
+		Features []string `json:"features"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+		return err
+	}
+	for _, advertised := range health.Features {
+		if advertised == feature {
+			return nil
+		}
+	}
+	return fmt.Errorf("daemon does not advertise %q", feature)
+}
+
 // sshManager owns the lifecycle of registered SSH hosts for one hub: bringing
 // up a transient loopback daemon on the remote over an SSH ControlMaster,
 // wiring the loopback port-forwards that carry hub↔hub traffic, and tearing it
@@ -166,6 +190,9 @@ func (m *sshManager) bringUp(n *network, host string, sh config.SSHHost) (*sshCo
 	// Wait for the daemon to answer through the forward.
 	if err := waitHealthyURL("http://"+remoteURL, 8*time.Second); err != nil {
 		return nil, err
+	}
+	if err := requireHealthFeatureURL("http://"+remoteURL, "explicit_nudge"); err != nil {
+		return nil, fmt.Errorf("remote daemon compatibility: %w (upgrade/restart hive)", err)
 	}
 
 	// 5b. -R reverse forward: let the remote hub reach THIS hub's loopback, and
@@ -367,15 +394,26 @@ func (h *Hub) spawnOntoSSH(w http.ResponseWriter, r *http.Request, n *network, i
 		httpErr(w, 502, "ssh host %q: %v", req.SSHHost, err)
 		return
 	}
+	// This must precede the mutating spawn. An older remote daemon implicitly
+	// nudged every pane, and discovering that from the spawn response is too
+	// late (and cannot be safely cleaned up for idempotent persistent spawns).
+	if err := requireHealthFeatureURL("http://"+url, "explicit_nudge"); err != nil {
+		httpErr(w, 502, "remote daemon compatibility: %v; upgrade/restart hive", err)
+		return
+	}
 
 	fwd := spawnReq{
 		Name: req.Name, Cmd: cmd, Cwd: cwd, Provision: &spec,
 		GrantControl: req.GrantControl, WaitReady: req.WaitReady,
-		Headed: req.Headed, Persist: req.Persist,
+		Nudge: req.Nudge, Headed: req.Headed, Persist: req.Persist,
 	}
 	var out spawnResp
-	if err := postJSON(url, "/v1/nets/"+n.name+"/spawn", ctlToken, fwd, &out, 30*time.Second); err != nil {
+	if err := postJSON(url, "/v1/nets/"+n.name+"/spawn/v2", ctlToken, fwd, &out, 30*time.Second); err != nil {
 		httpErr(w, 502, "forward spawn to %q: %v", req.SSHHost, err)
+		return
+	}
+	if out.NudgePolicy != "explicit" || out.Nudge != req.Nudge {
+		httpErr(w, 502, "remote daemon advertised explicit terminal nudging but did not honor the requested policy")
 		return
 	}
 	h.ssh.acquire(n.name, req.SSHHost)
