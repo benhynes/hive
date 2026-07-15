@@ -21,10 +21,22 @@ type Config struct {
 // this hub knows how to reach. The hosts list is local-only by design —
 // there is no cross-hub sync.
 type NetConfig struct {
-	Name         string            `json:"name"`
-	MsgToken     string            `json:"msg_token"`
-	ControlToken string            `json:"control_token,omitempty"`
-	Hosts        map[string]string `json:"hosts"` // host name -> "addr:port"
+	Name         string `json:"name"`
+	MsgToken     string `json:"msg_token"`
+	ControlToken string `json:"control_token,omitempty"`
+	// ControlHost binds ControlToken to one hub. Empty preserves the
+	// original network-wide token behavior for existing configurations.
+	ControlHost string            `json:"control_host,omitempty"`
+	Hosts       map[string]string `json:"hosts"` // host name -> "addr:port"
+}
+
+// ControlFor returns this configuration's control token only when it is
+// valid for host. A blank ControlHost means the legacy network-wide scope.
+func (n NetConfig) ControlFor(host string) string {
+	if n.ControlHost != "" && n.ControlHost != host {
+		return ""
+	}
+	return n.ControlToken
 }
 
 // Home returns the hive state directory ($HIVE_HOME or ~/.hive).
@@ -150,6 +162,9 @@ func ListNets() ([]string, error) {
 func writeFile0600(path string, b []byte) error {
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)

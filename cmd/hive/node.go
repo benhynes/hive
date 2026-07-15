@@ -34,6 +34,49 @@ func runNode(args []string) error {
 	}
 }
 
+type nodeControlMode uint8
+
+const (
+	nodeControlNone nodeControlMode = iota
+	nodeControlShared
+	nodeControlLocal
+)
+
+func (m nodeControlMode) String() string {
+	switch m {
+	case nodeControlShared:
+		return "shared"
+	case nodeControlLocal:
+		return "host-local"
+	default:
+		return "msg-only"
+	}
+}
+
+// selectNodeControl chooses the capability installed on a new node. A
+// host-local source token is never inherited: callers must explicitly mint a
+// different host-local token for the child with --local-control.
+func selectNodeControl(nc config.NetConfig, msgOnly, localControl bool) (nodeControlMode, string, error) {
+	if msgOnly && localControl {
+		return nodeControlNone, "", fmt.Errorf("--msg-only and --local-control are mutually exclusive")
+	}
+	if msgOnly {
+		return nodeControlNone, "", nil
+	}
+	if localControl {
+		for {
+			tok := proto.NewToken()
+			if tok != nc.MsgToken && tok != nc.ControlToken {
+				return nodeControlLocal, tok, nil
+			}
+		}
+	}
+	if nc.ControlToken == "" || nc.ControlHost != "" {
+		return nodeControlNone, "", nil
+	}
+	return nodeControlShared, nc.ControlToken, nil
+}
+
 func nodeInstall(args []string) error {
 	fs := flags("node install", args)
 	name := fs.String("name", "", "node's hive host name (default: its hostname)")
@@ -45,6 +88,7 @@ func nodeInstall(args []string) error {
 	bin := fs.String("bin", "", "prebuilt binary to ship (default: self-copy, or cross-compile from --src)")
 	src := fs.String("src", ".", "hive source dir for cross-compiling")
 	msgOnly := fs.Bool("msg-only", false, "don't ship the control token (node can never control anyone)")
+	localControl := fs.Bool("local-control", false, "mint control access valid only on the new node")
 	persist := fs.Bool("persist", false, "install a supervisor: systemd (Linux), launchd (macOS), or a boot scheduled task (Windows)")
 	noStart := fs.Bool("no-start", false, "install and configure only; don't start the daemon")
 	restart := fs.Bool("restart", false, "restart the node's daemon if one is already running (upgrades)")
@@ -63,10 +107,19 @@ func nodeInstall(args []string) error {
 	if err != nil {
 		return err
 	}
-	if nc.ControlToken == "" && !*msgOnly {
-		fmt.Println("note: this host holds no control token — installing the node msg-only")
-		*msgOnly = true
+	controlMode, nodeControlToken, err := selectNodeControl(nc, *msgOnly, *localControl)
+	if err != nil {
+		return err
 	}
+	if controlMode == nodeControlNone && !*msgOnly && nc.ControlHost != "" {
+		fmt.Printf("note: this host's control token is scoped to %s — installing the node msg-only (pass --local-control for an independent local token)\n", nc.ControlHost)
+	} else if controlMode == nodeControlNone && !*msgOnly {
+		fmt.Println("note: this host holds no control token — installing the node msg-only")
+	}
+	// A local-control reinstall rotates the node's token, so a running daemon
+	// must reload it. Treat --restart as implied unless --no-start suppresses
+	// all daemon lifecycle actions.
+	effectiveRestart := *restart || controlMode == nodeControlLocal
 
 	ssh, sshCleanup := newSSHRunner(target)
 	defer sshCleanup()
@@ -85,8 +138,9 @@ func nodeInstall(args []string) error {
 			return nodeInstallWindows(ssh, cfg, netName, nc, winOpts{
 				name: *name, bind: *bind, hub: *hubAddr, dest: *dest, home: *home,
 				bin: *bin, src: *src, port: *port,
-				msgOnly: *msgOnly, persist: *persist, noStart: *noStart,
-				restart: *restart, noAnnounce: *noAnnounce,
+				controlMode: controlMode, controlToken: nodeControlToken,
+				persist: *persist, noStart: *noStart,
+				restart: effectiveRestart, noAnnounce: *noAnnounce,
 				computer: comp, goarch: arch, profile: profile,
 			})
 		}
@@ -174,8 +228,8 @@ func nodeInstall(args []string) error {
 	warnLoopbackHub(cfg, hub)
 
 	// 5. Write the node's config and network state over the ssh channel.
-	fmt.Printf("configuring: host_name=%s bind=%s port=%d net=%s msg_only=%v\n",
-		*name, *bind, *port, netName, *msgOnly)
+	fmt.Printf("configuring: host_name=%s bind=%s port=%d net=%s control=%s\n",
+		*name, *bind, *port, netName, controlMode)
 	nodeCfg, _ := json.MarshalIndent(config.Config{HostName: *name, Bind: *bind, Port: *port}, "", "  ")
 	if err := writeRemote(ssh, homePath, homePath+"/config.json", nodeCfg); err != nil {
 		return err
@@ -185,8 +239,9 @@ func nodeInstall(args []string) error {
 		MsgToken: nc.MsgToken,
 		Hosts:    seedHosts(nc.Hosts, cfg.HostName, hub, *name, *port),
 	}
-	if !*msgOnly {
-		nodeNet.ControlToken = nc.ControlToken
+	nodeNet.ControlToken = nodeControlToken
+	if controlMode == nodeControlLocal {
+		nodeNet.ControlHost = *name
 	}
 	nodeNetJSON, _ := json.MarshalIndent(nodeNet, "", "  ")
 	if err := writeRemote(ssh, homePath+"/nets/"+netName, homePath+"/nets/"+netName+"/net.json", nodeNetJSON); err != nil {
@@ -207,9 +262,17 @@ func nodeInstall(args []string) error {
 				return err
 			}
 		}
+	} else if *noStart && effectiveRestart && healthOK(nodeURL) {
+		// A local-control reinstall rotates the accepted token. Leaving an
+		// existing daemon alive would leave the old capability active and the
+		// new on-disk token unusable until a later restart.
+		if _, err := ssh.run(nil, `sh -c 'pkill -f "[h]ive daemon" || true; sleep 0.3'`); err != nil {
+			return err
+		}
+		fmt.Println("daemon stopped so the rotated control token takes effect on next start")
 	} else if !*noStart {
 		running := healthOK(nodeURL)
-		if running && !*restart {
+		if running && !effectiveRestart {
 			fmt.Println("daemon already running — the old binary stays in memory (pass --restart to upgrade)")
 		} else {
 			if running {
@@ -235,9 +298,18 @@ func nodeInstall(args []string) error {
 
 	fmt.Printf("\nnode %q is in the mesh:\n", *name)
 	fmt.Printf("  hive agents                        # should reach @%s\n", *name)
-	fmt.Printf("  hive spawn --host %s w1 -- CMD...\n", *name)
+	switch controlMode {
+	case nodeControlShared:
+		fmt.Printf("  hive spawn --host %s w1 -- CMD...\n", *name)
+	case nodeControlLocal:
+		fmt.Printf("  on %s: hive spawn --grant-control w1 -- CMD...\n", *name)
+		fmt.Printf("note: %s has host-local control; the original network control token cannot control it remotely\n", *name)
+	}
 	if *noStart {
 		fmt.Printf("  start it: ssh %s '%s daemon'   (HIVE_HOME=%s if non-default)\n", target, destPath, homePath)
+		if controlMode == nodeControlLocal {
+			fmt.Printf("note: restart any existing daemon before using the new host-local control token\n")
+		}
 	}
 	if !*persist {
 		fmt.Printf("note: the daemon is not persisted across reboots (rerun with --persist)\n")
@@ -542,7 +614,13 @@ func announceAll(cfg config.Config, netName string, nc config.NetConfig, nodeNam
 		if host == nodeName {
 			continue
 		}
-		err := postHostsAdd(addr, netName, nc.ControlToken, nodeName, nodeAddr)
+		controlToken := nc.ControlFor(host)
+		if controlToken == "" {
+			fmt.Printf("announce to %-16s skipped (no capability for that host) — run there: hive hosts add %s %s\n",
+				host, nodeName, nodeAddr)
+			continue
+		}
+		err := postHostsAdd(addr, netName, controlToken, nodeName, nodeAddr)
 		switch {
 		case err == nil:
 			fmt.Printf("announced to %-16s %s\n", host, addr)

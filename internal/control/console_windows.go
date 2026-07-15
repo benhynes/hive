@@ -431,24 +431,6 @@ func Capture(pane string, lines int) (string, error) {
 	return conOp(pane, "capture", strconv.Itoa(lines))
 }
 
-// Live pane streaming needs tmux pipe-pane; the classic console API has
-// no equivalent (polling ReadConsoleOutput is the only read primitive).
-func StreamSupported() bool { return false }
-
-func CaptureRaw(pane string) (string, error) {
-	return "", fmt.Errorf("pane streaming is not supported on Windows")
-}
-
-func PaneSize(pane string) (cols, rows int, err error) {
-	return 0, 0, fmt.Errorf("pane streaming is not supported on Windows")
-}
-
-func PipeOpen(pane, path string) error {
-	return fmt.Errorf("pane streaming is not supported on Windows")
-}
-
-func PipeClose(pane string) error { return nil }
-
 // OpenWindow makes the session's console window visible — only possible
 // for sessions spawned with headed=true (CREATE_NO_WINDOW consoles have
 // no window at all, revealable or otherwise).

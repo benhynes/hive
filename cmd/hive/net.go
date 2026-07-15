@@ -4,16 +4,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/benhynes/hive/internal/client"
 	"github.com/benhynes/hive/internal/config"
 	"github.com/benhynes/hive/internal/proto"
 )
 
 func runNet(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: hive net <create|join|list|show> ...")
+		return fmt.Errorf("usage: hive net <create|join|list|show|rotate-control> ...")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -21,6 +23,8 @@ func runNet(args []string) error {
 		return netCreate(rest)
 	case "join":
 		return netJoin(rest)
+	case "rotate-control":
+		return netRotateControl(rest)
 	case "list":
 		nets, err := config.ListNets()
 		if err != nil {
@@ -163,12 +167,65 @@ func netShow(args []string) error {
 	fmt.Printf("msg token:     %s\n", nc.MsgToken)
 	if nc.ControlToken != "" {
 		fmt.Printf("control token: %s\n", nc.ControlToken)
+		if nc.ControlHost != "" {
+			fmt.Printf("control scope: host-local (%s)\n", nc.ControlHost)
+		} else {
+			fmt.Printf("control scope: network-wide (legacy/shared)\n")
+		}
 	} else {
-		fmt.Printf("control token: (none — this host is msg-only)\n")
+		fmt.Printf("control token: (none for this host)\n")
 	}
 	fmt.Printf("hosts:\n")
 	for name, addr := range nc.Hosts {
 		fmt.Printf("  %-16s %s\n", name, addr)
 	}
+	return nil
+}
+
+// netRotateControl revokes the current control token on this hub and replaces
+// it with a fresh host-local capability. The daemon performs the disk and
+// in-memory update together so there is no live old-token split brain.
+func netRotateControl(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: hive net rotate-control <name>")
+	}
+	if os.Getenv("HIVE_ADDR") != "" {
+		return fmt.Errorf("rotate-control only operates on this host; unset HIVE_ADDR")
+	}
+	name := args[0]
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	nc, err := config.LoadNet(name)
+	if err != nil {
+		return fmt.Errorf("network %q not found here", name)
+	}
+	if nc.ControlFor(cfg.HostName) == "" {
+		return fmt.Errorf("this host does not hold control for network %q", name)
+	}
+
+	newToken := proto.NewToken()
+	c, err := client.Resolve(name)
+	if err != nil {
+		return err
+	}
+	if !healthOK(c.Addr) {
+		return fmt.Errorf("local daemon is not reachable at %s; start it before rotating control", c.Addr)
+	}
+	if err := c.RotateControl(newToken); err != nil {
+		// The daemon persists before replying. If the response was lost after
+		// that write, recover deterministically from the shared local state
+		// instead of hiding the only copy of the new credential.
+		saved, loadErr := config.LoadNet(name)
+		if loadErr != nil || saved.ControlToken != newToken || saved.ControlHost != cfg.HostName {
+			return fmt.Errorf("rotate running hub: %w", err)
+		}
+	}
+
+	fmt.Printf("Rotated control for network %q on host %q.\n", name, cfg.HostName)
+	fmt.Printf("  control token: %s\n", newToken)
+	fmt.Printf("  scope:         host-local (%s)\n", cfg.HostName)
+	fmt.Printf("WARNING: this updates only %s. Any peer still using the old shared control token must run its own rotation or be reprovisioned; it continues accepting the old token until then.\n", cfg.HostName)
 	return nil
 }

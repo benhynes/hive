@@ -3,8 +3,12 @@
 #
 # Simulates two hosts ("hosta", "hostb") with separate HIVE_HOME state
 # dirs, separate ports, and a dedicated tmux socket. Walks: net create/
-# join, register, send/recv, ask/answer, broadcast, spawn/keys/read,
-# nudge, layer enforcement, kill, audit log. Cleans up after itself.
+# join, register, MCP messaging (send/recv/ask/answer/broadcast),
+# spawn/keys/read, nudge, layer enforcement, kill, audit log. Messaging
+# is driven through `hive mcp` — the MCP tools are the agent interface;
+# there is no `hive send`/`recv` CLI. Cleans up after itself.
+#
+# Needs: go, curl, tmux, python3.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -24,6 +28,28 @@ trap cleanup EXIT
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 run()  { printf '\033[36m$ %s\033[0m\n' "$*"; "$@"; }
+
+# rpc IDENTITY_FN TOOL ARGS_JSON — perform one hive_* MCP tool call as the
+# given identity and print the tool's text result. This is exactly what a
+# spawned agent does: `hive mcp` is its stdio MCP server, reading its HIVE_*
+# env. Messaging has no CLI; these tools are the interface.
+rpc() {
+  printf '%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}' \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"$2\",\"arguments\":$3}}" \
+  | "$1" \
+  | python3 -c '
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    m = json.loads(line)
+    if m.get("id") == 2:
+        r = m["result"]
+        text = "".join(c.get("text", "") for c in r.get("content", []))
+        sys.stdout.write(("ERROR: " if r.get("isError") else "") + text + "\n")'
+}
 
 step "build"
 go build -o "$BIN" ./cmd/hive
@@ -62,10 +88,9 @@ run A hosts list
 step "register alice on hosta (message-only external agent)"
 REG=$(A register --name alice --pane "")
 echo "$REG"
-alice() {  # act as alice: only her exports, no local net.json fallback
-  env HIVE_HOME=$ROOT/empty HIVE_TMUX_SOCKET=$HIVE_TMUX_SOCKET \
-    $(echo "$REG" | sed 's/^export //') "$BIN" "$@"
-}
+# act as alice: only her exports, no local net.json fallback
+alice()     { env HIVE_HOME=$ROOT/empty HIVE_TMUX_SOCKET=$HIVE_TMUX_SOCKET $(echo "$REG" | sed 's/^export //') "$BIN" "$@"; }
+alice_mcp() { alice mcp; }
 
 step "spawn 'worker' on hostb, driven from hosta (control goes direct)"
 run A spawn --host hostb --wait worker -- cat
@@ -78,32 +103,36 @@ run A keys --enter worker@hostb "hello from hosta"
 sleep 0.4
 run A read worker@hostb
 
-step "alice sends mail to worker; the idle pane gets nudged (body never injected)"
-run alice send worker@hostb "psst — status report please"
+step "alice sends mail via her hive_send tool; the idle pane gets nudged (with a preview)"
+run rpc alice_mcp hive_send '{"to":"worker@hostb","body":"psst — status report please"}'
 sleep 1.2
 run A read worker@hostb
 
-step "worker checks mail (as the spawned agent would: its own HIVE_* env)"
+step "worker reads its mail via hive_recv (as the spawned agent would: its own HIVE_* env)"
 WENV=$(tmux -L "$HIVE_TMUX_SOCKET" show-environment -t hive-dev-worker 2>/dev/null | grep '^HIVE_' || true)
-worker() { env HIVE_HOME=$ROOT/empty HIVE_TMUX_SOCKET=$HIVE_TMUX_SOCKET $WENV "$BIN" "$@"; }
-run worker recv
+worker_mcp() { env HIVE_HOME=$ROOT/empty HIVE_TMUX_SOCKET=$HIVE_TMUX_SOCKET $WENV "$BIN" mcp; }
+run rpc worker_mcp hive_recv '{}'
 
-step "ask/answer: alice asks worker, worker answers, alice gets it (blocking)"
-( ASK_ID=""
+step "the messaging interface is MCP — worker's offered tools:"
+env HIVE_HOME=$ROOT/empty HIVE_TMUX_SOCKET=$HIVE_TMUX_SOCKET $WENV "$BIN" mcp --list
+
+step "ask/answer over MCP: alice asks (blocks), worker answers, alice gets it"
+( ASK=""
   for _ in $(seq 1 50); do
-    ASK_ID=$(worker asks | awk '/from alice@hosta/{print $1; exit}')
-    [ -n "$ASK_ID" ] && break
+    ASK=$(rpc worker_mcp hive_asks '{}' | python3 -c 'import sys,json
+a=json.load(sys.stdin); print(a[0]["ask_id"] if a else "")' 2>/dev/null || true)
+    [ -n "$ASK" ] && break
     sleep 0.2
   done
-  worker answer "$ASK_ID" "all systems nominal" >/dev/null
+  rpc worker_mcp hive_answer "{\"ask_id\":\"$ASK\",\"body\":\"all systems nominal\"}" >/dev/null
 ) &
 ANSWERER=$!
-run alice ask --timeout 30 worker@hostb "status?"
+run rpc alice_mcp hive_ask '{"to":"worker@hostb","question":"status?","timeout":30}'
 wait "$ANSWERER"
 
 step "broadcast from alice"
-run alice send @all "stand-up in 5"
-run worker recv
+run rpc alice_mcp hive_send '{"to":"@all","body":"stand-up in 5"}'
+run rpc worker_mcp hive_recv '{}'
 
 step "layer enforcement: alice (MSG) cannot control anyone"
 if alice read worker@hostb 2>&1; then

@@ -51,7 +51,12 @@ func TestIDsUnique(t *testing.T) {
 
 func TestTokens(t *testing.T) {
 	tok := NewToken()
-	if len(tok) != 64 || HashToken(tok) == HashToken(tok+"x") {
+	if !ValidToken(tok) || HashToken(tok) == HashToken(tok+"x") {
 		t.Fatal("token gen/hash broken")
+	}
+	for _, bad := range []string{"", tok[:63], tok + "0", strings.Repeat("z", 64)} {
+		if ValidToken(bad) {
+			t.Fatalf("invalid token accepted: %q", bad)
+		}
 	}
 }

@@ -118,9 +118,11 @@ func SendKeysLiteral(pane, text string) error {
 	return err
 }
 
-// Enter presses Enter in a pane.
+// Enter writes the carriage-return byte used by a terminal's Enter key.
+// Sending tmux's symbolic "Enter" key can be swallowed by TUIs that enable
+// extended keyboard reporting after startup; the raw byte remains stable.
 func Enter(pane string) error {
-	_, err := run("send-keys", "-t", pane, "Enter")
+	_, err := run("send-keys", "-t", pane, "-H", "0d")
 	return err
 }
 
@@ -146,57 +148,10 @@ func Capture(pane string, lines int) (string, error) {
 	return run(a...)
 }
 
-// CaptureRaw returns the visible pane content with escape sequences
-// preserved (-e), followed by a cursor-position escape, so replaying it
-// into a terminal emulator reproduces the screen. -N keeps trailing
-// spaces so full-width TUI backgrounds survive.
-func CaptureRaw(pane string) (string, error) {
-	out, err := run("capture-pane", "-p", "-e", "-N", "-t", pane)
-	if err != nil {
-		return "", err
-	}
-	// capture-pane separates lines with bare \n; a terminal needs \r\n
-	// or every line starts where the previous one ended (staircase).
-	out = strings.ReplaceAll(out, "\n", "\r\n")
-	pos, err := run("display-message", "-p", "-t", pane, "#{cursor_y} #{cursor_x}")
-	if err != nil {
-		return out, nil
-	}
-	var y, x int
-	if _, err := fmt.Sscanf(strings.TrimSpace(pos), "%d %d", &y, &x); err == nil {
-		out += fmt.Sprintf("\x1b[%d;%dH", y+1, x+1)
-	}
-	return out, nil
-}
-
-// PaneSize returns the pane's columns and rows.
-func PaneSize(pane string) (cols, rows int, err error) {
-	out, err := run("display-message", "-p", "-t", pane, "#{pane_width} #{pane_height}")
-	if err != nil {
-		return 0, 0, err
-	}
-	_, err = fmt.Sscanf(strings.TrimSpace(out), "%d %d", &cols, &rows)
-	return cols, rows, err
-}
-
-// PipeOpen starts piping the pane's raw output into path (a FIFO the
-// caller created). Replaces any existing pipe on the pane; tmux allows
-// one pipe per pane.
-func PipeOpen(pane, path string) error {
-	_, err := run("pipe-pane", "-t", pane, "cat > "+shellQuote(path))
-	return err
-}
-
-// PipeClose stops piping the pane's output.
-func PipeClose(pane string) error {
-	_, err := run("pipe-pane", "-t", pane)
-	return err
-}
-
 // PaneExists reports whether the pane is still alive.
 func PaneExists(pane string) bool {
-	_, err := run("display-message", "-p", "-t", pane, "ok")
-	return err == nil
+	out, err := run("display-message", "-p", "-t", pane, "#{pane_id}")
+	return err == nil && strings.TrimSpace(out) == pane
 }
 
 // PanePID returns the pid of the process running in the pane.

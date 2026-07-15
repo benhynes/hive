@@ -142,6 +142,10 @@ func TestPaneLifecycle(t *testing.T) {
 	if epoch != epoch2 {
 		t.Fatalf("epoch changed: %q -> %q", epoch, epoch2)
 	}
+	if _, _, err := NewSession("survivor", "", nil, []string{"sleep", "60"}); err != nil {
+		t.Fatal(err)
+	}
+	defer KillSession("survivor")
 	if err := KillSession("life"); err != nil {
 		t.Fatal(err)
 	}

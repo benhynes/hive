@@ -1,10 +1,14 @@
 // End-to-end tests: build the real binary, run two daemons on this
-// machine (separate HIVE_HOME, distinct host names, one shared network),
-// and drive everything through the CLI. Control ops run against a real
-// tmux server on a dedicated socket, like internal/tmux's tests.
+// machine (separate HIVE_HOME, distinct host names, one shared network).
+// Control ops (spawn/keys/read/kill) and setup (net/register/hosts) run
+// through the CLI; messaging (send/recv/ask) has no CLI anymore — agents use
+// MCP — so the hub's delivery paths are driven here over the /v1 HTTP API,
+// with single-host send/recv/ask/answer covered end-to-end via MCP in
+// TestMCPEndToEnd. tmux runs on a dedicated socket, like internal/tmux's tests.
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -180,6 +184,72 @@ func httpJSON(t *testing.T, method, url, token, body string) (int, string) {
 	return resp.StatusCode, sb.String()
 }
 
+// apiSend delivers a message over the /v1 API as the agent whose env is given,
+// returning the raw /send response (so callers can assert on the per-target
+// results map). It replaces what `hive send` used to do from the shell.
+func apiSend(t *testing.T, env []string, to, body string) string {
+	t.Helper()
+	tok := envVal(t, env, "HIVE_TOKEN")
+	addr := envVal(t, env, "HIVE_ADDR")
+	net := envVal(t, env, "HIVE_NET")
+	// The API wants name@host; the CLI used to expand a bare name to the
+	// sender's own host, so mirror that here.
+	if to != "@all" && !strings.Contains(to, "@") {
+		if _, host, ok := strings.Cut(envVal(t, env, "HIVE_AGENT"), "@"); ok {
+			to = to + "@" + host
+		}
+	}
+	reqBody, _ := json.Marshal(map[string]string{"to": to, "kind": "msg", "body": body})
+	code, resp := httpJSON(t, "POST", addr+"/v1/nets/"+net+"/send", tok, string(reqBody))
+	if code != 200 {
+		t.Fatalf("send to %s: %d %s", to, code, resp)
+	}
+	return resp
+}
+
+// apiRecv reads the agent's inbox from its stored cursor, acks what it read,
+// and renders each message as "<from> body" — enough for the delivery
+// assertions. waitSecs > 0 long-polls, like `hive recv --wait`.
+func apiRecv(t *testing.T, env []string, waitSecs int) string {
+	t.Helper()
+	tok := envVal(t, env, "HIVE_TOKEN")
+	addr := envVal(t, env, "HIVE_ADDR")
+	net := envVal(t, env, "HIVE_NET")
+	url := addr + "/v1/nets/" + net + "/inbox"
+	if waitSecs > 0 {
+		url += fmt.Sprintf("?wait=%d", waitSecs)
+	}
+	code, resp := httpJSON(t, "GET", url, tok, "")
+	if code != 200 {
+		t.Fatalf("inbox: %d %s", code, resp)
+	}
+	var rr struct {
+		Msgs []struct {
+			Seq int64 `json:"seq"`
+			Env struct {
+				From string `json:"from"`
+				Body string `json:"body"`
+			} `json:"env"`
+		} `json:"msgs"`
+	}
+	if err := json.Unmarshal([]byte(resp), &rr); err != nil {
+		t.Fatalf("inbox decode: %v: %s", err, resp)
+	}
+	var sb strings.Builder
+	var top int64
+	for _, m := range rr.Msgs {
+		fmt.Fprintf(&sb, "<%s> %s\n", m.Env.From, m.Env.Body)
+		if m.Seq > top {
+			top = m.Seq
+		}
+	}
+	if top > 0 {
+		ackBody, _ := json.Marshal(map[string]int64{"seq": top})
+		httpJSON(t, "POST", addr+"/v1/nets/"+net+"/ack", tok, string(ackBody))
+	}
+	return sb.String()
+}
+
 func TestEndToEnd(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e: two daemons + tmux")
@@ -207,18 +277,10 @@ func TestEndToEnd(t *testing.T) {
 	alice := register(t, a, "alice")
 	bob := register(t, a, "bob")
 
-	t.Run("send-recv-ack", func(t *testing.T) {
-		mustCLI(t, alice, "send", "bob", "hello bob")
-		out := mustCLI(t, bob, "recv")
-		if !strings.Contains(out, "<alice@hosta>") || !strings.Contains(out, "hello bob") {
-			t.Fatalf("recv: %q", out)
-		}
-		// Acked: a second recv sees nothing new.
-		out = mustCLI(t, bob, "recv")
-		if strings.Contains(out, "hello bob") {
-			t.Fatalf("message not acked, recv again: %q", out)
-		}
-	})
+	// Single-host send/recv/ack and ask/answer are covered end-to-end over the
+	// real agent interface in TestMCPEndToEnd; the subtests here exercise the
+	// hub paths MCP e2e doesn't reach — from-stamping, broadcast, cross-hub
+	// routing, and msg-only hosts.
 
 	t.Run("from-is-stamped-not-spoofable", func(t *testing.T) {
 		// Inject a bogus `from` via the raw API using alice's token.
@@ -228,7 +290,7 @@ func TestEndToEnd(t *testing.T) {
 		if code != 200 {
 			t.Fatalf("send: %d %s", code, body)
 		}
-		out := mustCLI(t, bob, "recv")
+		out := apiRecv(t, bob, 0)
 		if !strings.Contains(out, "<alice@hosta>") || strings.Contains(out, "admin@hosta") {
 			t.Fatalf("from not stamped from token: %q", out)
 		}
@@ -283,50 +345,12 @@ func TestEndToEnd(t *testing.T) {
 		}
 	})
 
-	t.Run("ask-answer", func(t *testing.T) {
-		type askRes struct {
-			out string
-			err error
-		}
-		ch := make(chan askRes, 1)
-		go func() {
-			out, err := cli(t, alice, "ask", "--timeout", "30", "bob", "what is the port?")
-			ch <- askRes{out, err}
-		}()
-		// Bob finds the ask and answers it.
-		idRe := regexp.MustCompile(`(?m)^([0-9a-f]{16})  from alice@hosta`)
-		var askID string
-		deadline := time.Now().Add(10 * time.Second)
-		for askID == "" && time.Now().Before(deadline) {
-			out := mustCLI(t, bob, "asks")
-			if m := idRe.FindStringSubmatch(out); m != nil {
-				askID = m[1]
-			} else {
-				time.Sleep(100 * time.Millisecond)
-			}
-		}
-		if askID == "" {
-			t.Fatal("bob never saw the ask")
-		}
-		mustCLI(t, bob, "answer", askID, "port 7777")
-		res := <-ch
-		if res.err != nil {
-			t.Fatal(res.err)
-		}
-		if strings.TrimSpace(res.out) != "port 7777" {
-			t.Fatalf("ask answer: %q", res.out)
-		}
-	})
-
 	t.Run("recv-long-poll", func(t *testing.T) {
-		cli(t, bob, "recv") // drain: asks/answer peek without acking
+		apiRecv(t, bob, 0) // drain anything pending
 		ch := make(chan string, 1)
-		go func() {
-			out, _ := cli(t, bob, "recv", "--wait", "15")
-			ch <- out
-		}()
+		go func() { ch <- apiRecv(t, bob, 15) }()
 		time.Sleep(300 * time.Millisecond) // let the long-poll arm
-		mustCLI(t, alice, "send", "bob", "wake up")
+		apiSend(t, alice, "bob", "wake up")
 		select {
 		case out := <-ch:
 			if !strings.Contains(out, "wake up") {
@@ -353,8 +377,8 @@ func TestEndToEnd(t *testing.T) {
 	})
 
 	t.Run("cross-hub-send", func(t *testing.T) {
-		mustCLI(t, alice, "send", "carol@hostb", "hello across")
-		out := mustCLI(t, carol, "recv")
+		apiSend(t, alice, "carol@hostb", "hello across")
+		out := apiRecv(t, carol, 0)
 		if !strings.Contains(out, "<alice@hosta>") || !strings.Contains(out, "hello across") {
 			t.Fatalf("cross-hub recv: %q", out)
 		}
@@ -370,7 +394,7 @@ func TestEndToEnd(t *testing.T) {
 	})
 
 	t.Run("broadcast", func(t *testing.T) {
-		out := mustCLI(t, alice, "send", "@all", "all hands")
+		out := apiSend(t, alice, "@all", "all hands")
 		for _, want := range []string{"bob@hosta", "carol@hostb"} {
 			if !strings.Contains(out, want) {
 				t.Fatalf("broadcast results missing %s:\n%s", want, out)
@@ -380,35 +404,9 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("broadcast echoed to sender:\n%s", out)
 		}
 		for who, env := range map[string][]string{"bob": bob, "carol": carol} {
-			if out := mustCLI(t, env, "recv"); !strings.Contains(out, "all hands") {
+			if out := apiRecv(t, env, 0); !strings.Contains(out, "all hands") {
 				t.Fatalf("%s missed broadcast: %q", who, out)
 			}
-		}
-	})
-
-	t.Run("cross-hub-ask", func(t *testing.T) {
-		ch := make(chan string, 1)
-		go func() {
-			out, _ := cli(t, carol, "ask", "--timeout", "30", "alice@hosta", "ping?")
-			ch <- out
-		}()
-		idRe := regexp.MustCompile(`(?m)^([0-9a-f]{16})  from carol@hostb`)
-		var askID string
-		deadline := time.Now().Add(10 * time.Second)
-		for askID == "" && time.Now().Before(deadline) {
-			out := mustCLI(t, alice, "asks")
-			if m := idRe.FindStringSubmatch(out); m != nil {
-				askID = m[1]
-			} else {
-				time.Sleep(100 * time.Millisecond)
-			}
-		}
-		if askID == "" {
-			t.Fatal("alice never saw carol's ask")
-		}
-		mustCLI(t, alice, "answer", askID, "pong")
-		if out := <-ch; strings.TrimSpace(out) != "pong" {
-			t.Fatalf("cross-hub ask: %q", out)
 		}
 	})
 
@@ -437,22 +435,20 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("spawned agent not in mesh listing:\n%s", out)
 		}
 
-		// New mail nudges the idle pane.
-		mustCLI(t, alice, "send", "worker@hostb", "you have mail")
+		// New mail nudges the idle pane, carrying the sender and a body
+		// preview so the agent can act without a recv round trip.
+		apiSend(t, alice, "worker@hostb", "you have mail")
 		deadline = time.Now().Add(5 * time.Second)
 		nudged := false
 		for !nudged && time.Now().Before(deadline) {
 			screen = mustCLI(t, a.env(), "read", "worker@hostb")
-			nudged = strings.Contains(screen, "hive recv")
+			nudged = strings.Contains(screen, "alice@hosta") && strings.Contains(screen, "you have mail")
 			if !nudged {
 				time.Sleep(100 * time.Millisecond)
 			}
 		}
 		if !nudged {
-			t.Fatalf("idle agent never nudged:\n%s", screen)
-		}
-		if strings.Contains(screen, "you have mail") {
-			t.Fatalf("nudge leaked the message body:\n%s", screen)
+			t.Fatalf("idle agent never nudged with sender + preview:\n%s", screen)
 		}
 
 		out = mustCLI(t, a.env(), "kill", "worker@hostb")
@@ -470,8 +466,8 @@ func TestEndToEnd(t *testing.T) {
 		mustCLI(t, c.env(), "net", "join", "dev", "--hub", a.addr(), "--msg-token", a.msgTok)
 		mustCLI(t, a.env(), "hosts", "add", "hostc", c.addr())
 		dave := register(t, c, "dave")
-		mustCLI(t, dave, "send", "alice@hosta", "from the cheap seats")
-		if out := mustCLI(t, alice, "recv"); !strings.Contains(out, "from the cheap seats") {
+		apiSend(t, dave, "alice@hosta", "from the cheap seats")
+		if out := apiRecv(t, alice, 0); !strings.Contains(out, "from the cheap seats") {
 			t.Fatalf("msg-only host send failed: %q", out)
 		}
 		// Without the control token, control ops fail client-side.

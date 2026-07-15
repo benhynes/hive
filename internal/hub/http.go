@@ -70,7 +70,7 @@ func (h *Hub) withNet(level int, fn netHandler) http.HandlerFunc {
 			httpErr(w, 404, "unknown network")
 			return
 		}
-		id, ok := n.resolve(bearer(r))
+		id, ok := n.resolve(bearer(r), h.Cfg.HostName)
 		if !ok {
 			httpErr(w, 401, "bad or missing token")
 			return
@@ -97,6 +97,7 @@ func (h *Hub) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"api": "hive", "v": 1, "host": h.Cfg.HostName})
 	})
+	mux.HandleFunc("GET /metrics", h.hMetrics)
 	mux.HandleFunc("POST /v1/nets/{net}/register", h.withNet(accNetTok, h.hRegister))
 	mux.HandleFunc("POST /v1/nets/{net}/deregister", h.withNet(accAny, h.hDeregister))
 	mux.HandleFunc("GET /v1/nets/{net}/agents", h.withNet(accAny, h.hAgents))
@@ -106,10 +107,10 @@ func (h *Hub) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/nets/{net}/ack", h.withNet(accAny, h.hAck))
 	mux.HandleFunc("GET /v1/nets/{net}/hosts", h.withNet(accAny, h.hHostsGet))
 	mux.HandleFunc("POST /v1/nets/{net}/hosts", h.withNet(accControl, h.hHostsPost))
+	mux.HandleFunc("POST /v1/nets/{net}/control/rotate", h.withNet(accControl, h.hRotateControl))
 	mux.HandleFunc("POST /v1/nets/{net}/spawn", h.withNet(accControl, h.hSpawn))
 	mux.HandleFunc("POST /v1/nets/{net}/keys", h.withNet(accControl, h.hKeys))
 	mux.HandleFunc("GET /v1/nets/{net}/read", h.withNet(accControl, h.hRead))
-	mux.HandleFunc("GET /v1/nets/{net}/stream", h.withNet(accControl, h.hStream))
 	mux.HandleFunc("POST /v1/nets/{net}/kill", h.withNet(accControl, h.hKill))
 	return mux
 }
@@ -564,6 +565,39 @@ func (h *Hub) hHostsPost(w http.ResponseWriter, r *http.Request, n *network, id 
 
 // ---- control ----
 
+func (h *Hub) hRotateControl(w http.ResponseWriter, r *http.Request, n *network, id ident) {
+	var req struct {
+		Token string `json:"token"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	if !proto.ValidToken(req.Token) {
+		httpErr(w, 400, "new control token must be 64 hexadecimal characters")
+		return
+	}
+
+	n.mu.Lock()
+	next := n.cfg
+	if req.Token == next.ControlToken && next.ControlHost == h.Cfg.HostName {
+		n.mu.Unlock()
+		httpErr(w, 400, "new control token is unchanged")
+		return
+	}
+	next.ControlToken = req.Token
+	next.ControlHost = h.Cfg.HostName
+	if err := config.SaveNet(next); err != nil {
+		n.mu.Unlock()
+		httpErr(w, 500, "save: %v", err)
+		return
+	}
+	n.cfg = next
+	n.mu.Unlock()
+
+	n.auditLine(h.actor(r, id), "rotate-control", h.Cfg.HostName, "new token is host-local")
+	writeJSON(w, 200, map[string]string{"control_host": h.Cfg.HostName})
+}
+
 type spawnReq struct {
 	Name         string   `json:"name"`
 	Cmd          []string `json:"cmd"`
@@ -680,12 +714,16 @@ func (h *Hub) spawnEnv(n *network, req spawnReq) (string, map[string]string, err
 	}
 	if req.GrantControl {
 		n.mu.Lock()
-		ctl := n.cfg.ControlToken
+		ctl := n.cfg.ControlFor(h.Cfg.HostName)
+		ctlHost := n.cfg.ControlHost
 		n.mu.Unlock()
 		if ctl == "" {
 			return "", nil, fmt.Errorf("this host has no control token to grant")
 		}
 		env["HIVE_CONTROL_TOKEN"] = ctl
+		if ctlHost != "" {
+			env["HIVE_CONTROL_HOST"] = ctlHost
+		}
 	}
 	return tok, env, nil
 }
@@ -881,69 +919,6 @@ func (h *Hub) hRead(w http.ResponseWriter, r *http.Request, n *network, id ident
 	}
 	n.auditLine(h.actor(r, id), "read", rec.Name+"@"+h.Cfg.HostName, fmt.Sprintf("lines=%d", lines))
 	writeJSON(w, 200, map[string]any{"agent": rec.Name + "@" + h.Cfg.HostName, "screen": out})
-}
-
-// hStream sends the pane's screen (escape sequences + cursor position),
-// then live raw output until the client disconnects or the pane dies.
-// Pane geometry rides in headers so a terminal emulator can size itself
-// before the first byte. One tmux pipe-pane feeds all concurrent
-// streams; see internal/hub/stream.go.
-func (h *Hub) hStream(w http.ResponseWriter, r *http.Request, n *network, id ident) {
-	if !control.StreamSupported() {
-		httpErr(w, 501, "pane streaming is not supported on this host")
-		return
-	}
-	rec, ok := h.localControllable(w, n, r.URL.Query().Get("agent"))
-	if !ok {
-		return
-	}
-	fl, ok := w.(http.Flusher)
-	if !ok {
-		httpErr(w, 500, "streaming unsupported by server")
-		return
-	}
-	cols, rows, err := control.PaneSize(rec.Pane)
-	if err != nil {
-		httpErr(w, 500, "pane size: %v", err)
-		return
-	}
-	// Subscribe before the snapshot: output between the two is then
-	// delivered rather than lost (duplicated bytes just redraw).
-	ch, cancel, err := h.streams.Subscribe(rec.Pane)
-	if err != nil {
-		httpErr(w, 500, "stream: %v", err)
-		return
-	}
-	defer cancel()
-	snap, err := control.CaptureRaw(rec.Pane)
-	if err != nil {
-		httpErr(w, 500, "capture: %v", err)
-		return
-	}
-	n.auditLine(h.actor(r, id), "stream", rec.Name+"@"+h.Cfg.HostName, "open")
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("X-Hive-Cols", strconv.Itoa(cols))
-	w.Header().Set("X-Hive-Rows", strconv.Itoa(rows))
-	w.WriteHeader(200)
-	if _, err := w.Write([]byte(snap)); err != nil {
-		return
-	}
-	fl.Flush()
-	ctx := r.Context()
-	for {
-		select {
-		case chunk, ok := <-ch:
-			if !ok {
-				return // pane died or we fell behind; client reconnects
-			}
-			if _, err := w.Write(chunk); err != nil {
-				return
-			}
-			fl.Flush()
-		case <-ctx.Done():
-			return
-		}
-	}
 }
 
 func (h *Hub) hKill(w http.ResponseWriter, r *http.Request, n *network, id ident) {

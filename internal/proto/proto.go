@@ -94,6 +94,16 @@ func NewToken() string {
 	return hex.EncodeToString(b[:])
 }
 
+// ValidToken reports whether tok has the canonical 256-bit hex encoding used
+// for network and agent bearer tokens.
+func ValidToken(tok string) bool {
+	if len(tok) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(tok)
+	return err == nil
+}
+
 // HashToken is the storage form of a token: hex(sha256(token)).
 func HashToken(tok string) string {
 	s := sha256.Sum256([]byte(tok))

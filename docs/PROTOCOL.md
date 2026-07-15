@@ -14,7 +14,7 @@ Errors are `{"error": "..."}` with a non-200 status.
 
 | token | who holds it | layer | notes |
 |---|---|---|---|
-| network **control** token | hubs, humans, `--grant-control` agents | CONTROL | full access; possession is the capability |
+| hub **control** token | hubs, humans, `--grant-control` agents | CONTROL | full access on accepting hub(s); possession is the capability |
 | network **msg** token | every member hub | MSG | join/infrastructure credential; can register agents and deliver hub↔hub |
 | **per-agent** token | one agent | MSG | minted at registration; identity-bearing |
 
@@ -26,11 +26,19 @@ via the advisory `X-Hive-Actor` header).
 Tokens are 256-bit hex strings; hubs store only `sha256(token)` and
 compare in constant time.
 
+Existing network configs have a shared control token. A config with
+`control_host: "vm1"` makes its control token valid only on `vm1`.
+Clients carrying that binding refuse to send the token to any other
+hub. `hive node install --local-control` creates this form with an
+independent token; `hive net rotate-control <net>` replaces the local
+hub's token with this form. The MSG token remains shared for routing.
+
 ### Endpoint access matrix
 
 | endpoint | access |
 |---|---|
 | `GET  /v1/health` | none |
+| `GET  /metrics` | none; aggregate counts only |
 | `POST /v1/nets/{net}/register` | network token (msg or control) |
 | `POST /v1/nets/{net}/deregister` | any (self), control (others) |
 | `GET  /v1/nets/{net}/agents` | any valid token |
@@ -40,6 +48,7 @@ compare in constant time.
 | `POST /v1/nets/{net}/ack` | agent token (own inbox only) |
 | `GET  /v1/nets/{net}/hosts` | any valid token |
 | `POST /v1/nets/{net}/hosts` | control |
+| `POST /v1/nets/{net}/control/rotate` | control |
 | `POST /v1/nets/{net}/spawn` | control |
 | `POST /v1/nets/{net}/keys` | control |
 | `GET  /v1/nets/{net}/read` | control |
@@ -83,8 +92,9 @@ bodies are capped at 64 KiB.
   results).
 - **Control ops** go CLI → target hub **direct** (fewer hops, the
   CONTROL credential never transits an intermediate hub, and the audit
-  log lives where the action happened). A hub receiving a control op
-  for an agent it doesn't own answers `400 misrouted`.
+  log lives where the action happened). A host-local credential is
+  rejected client-side for any other target host. A hub receiving a
+  control op for an agent it doesn't own answers `400 misrouted`.
 - Hosts lists are **local to each hub** (`hive hosts add`) — static
   lookup, no push/sync. An unknown or down host yields a fast
   `undeliverable` result, never a queue.
@@ -94,6 +104,13 @@ bodies are capped at 64 KiB.
 ### `GET /v1/health`
 → `{"api":"hive","v":1,"host":"mac"}`. Unauthenticated; used by
 `net join` to learn a peer's host name.
+
+### `GET /metrics`
+Prometheus text exposition with aggregate daemon, network, agent-liveness,
+persistent-session readiness, inbox-lag, routing-table, and control-scope
+gauges. It is
+unauthenticated so a read-only collector never holds Hive control, and it
+never includes agent names, tokens, addresses, messages, prompts, or panes.
 
 ### `POST /register` `{name, pane?, pid?}`
 Binds identity for liveness: with `pane` (the caller's `$TMUX_PANE` on
@@ -132,11 +149,18 @@ Agents ack only their own inbox.
 ### `GET/POST /hosts` `{op: add|rm, name, addr}`
 Read (any token) / mutate (control) this hub's local hosts list.
 
+### `POST /control/rotate` `{token}`
+Replaces this hub's control token and binds the replacement to its host
+name. The `net.json` write completes before in-memory authentication
+switches; after success the old token is rejected. The CLI mints the
+token and warns that peers must be rotated separately.
+
 ### `POST /spawn` `{name, cmd[], cwd?, grant_control?, wait_ready?, headed?}`
 Creates tmux session `hive-<net>-<name>` via `new-session -d -e ...`
 (env injected by tmux, never shell-interpolated), registers the agent
 bound to its pane, and injects `HIVE_ADDR/HIVE_NET/HIVE_AGENT/
-HIVE_TOKEN` (+ `HIVE_CONTROL_TOKEN` with `grant_control`).
+HIVE_TOKEN` (+ `HIVE_CONTROL_TOKEN` with `grant_control`, and
+`HIVE_CONTROL_HOST` when that token is host-local).
 `wait_ready` polls until the pane stops changing (≤15 s). `headed`
 opens a visible terminal window on the target host attached to the
 session (Terminal.app on macOS; `$TERMINAL` or a common emulator on
@@ -167,10 +191,32 @@ sends `kind=answer` back to its `from`.
 
 ## Nudge
 
-When fresh mail lands for an idle tmux-bound agent (no live long-poll
-on its inbox), the hub types one line into its pane:
-`hive: N new message(s) — run: hive recv`. Coalesced to one per 30 s
-per agent; message bodies are never injected.
+When fresh mail lands for an idle tmux-bound agent (no live long-poll on
+its inbox), the hub types one line into its pane, e.g.
+`hive: alice@mac says: the build is green  (+2 more — hive_recv)`. The line
+carries the sender and a **single-line, length-capped preview** (≤240
+bytes) of the oldest unread body, so the agent can often act without a
+`recv` round trip; the full body still arrives via `recv`. `ask` mail is
+flagged `asks:` rather than `says:`. The preview is whitespace-folded to
+one line — a raw newline is never injected, since it would submit early in
+a TUI.
+
+Re-arming is keyed on the inbox's latest seq, not a wall-clock window: an
+agent is nudged when mail arrives past what it was last nudged about,
+subject to a 2 s anti-burst floor and a 30 s reminder cadence for mail it
+has been told about but not yet read. A background sweeper re-checks idle
+pane-bound agents every few seconds, so a message that lands inside the
+anti-burst floor is still announced promptly. (Earlier versions nudged
+only as a side effect of delivery, so a message arriving in the quiet
+window with no later traffic could go unannounced indefinitely.)
+
+The preview means a message body — sender-supplied bytes — is typed into a
+recipient's pane. This is deliberate and within the trust model: mesh
+members are trusted, `from` is authenticated, and any control-holder can
+already type arbitrary text into any pane. It is a weaker capability than
+CONTROL keys, but it is a real change from the previous "bodies are never
+injected" rule. Agents are assumed to be TUI agents where typed text is a
+prompt, not a shell that would execute it.
 
 ## Liveness
 
@@ -178,6 +224,21 @@ An agent is *alive* while its bound pane exists and its pid still has
 the recorded start-epoch. Dead agents stay listed (`alive: false`)
 until deregistered, killed, or their name is reclaimed by a new
 registration.
+
+## MCP
+
+`hive mcp` (see the agent guide) is a **client-side surface, not part of
+this wire protocol.** It is a stdio MCP server that speaks JSON-RPC 2.0
+to the agent and plain `/v1` HTTP to the hub, exactly as the CLI does —
+the hub is unchanged and unaware. Permission layers therefore hold
+without any new enforcement: the MCP server holds only the credentials in
+its environment, and CONTROL tools are omitted from `tools/list` entirely
+when it holds no control token.
+
+`internal/mcp` keeps the protocol (`Server.Handle`) separate from the
+framing (`ServeStdio`), so serving MCP from the hub over HTTP would add a
+second caller of `Handle` rather than a second implementation. That
+endpoint does not exist today.
 
 ## Durability
 

@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"strings"
 
 	"github.com/benhynes/hive/internal/client"
@@ -11,7 +13,7 @@ func runSpawn(args []string) error {
 	fs := flags("spawn", args)
 	host := fs.String("host", "", "target host (default: this host)")
 	cwd := fs.String("cwd", "", "working directory for the spawned process")
-	grant := fs.Bool("grant-control", false, "inject the network control token (CONTROL layer)")
+	grant := fs.Bool("grant-control", false, "inject this host's control token (CONTROL layer)")
 	waitReady := fs.Bool("wait", false, "wait until the pane draws and goes quiet")
 	headed := fs.Bool("headed", false, "open a visible terminal window on the target host attached to the session")
 	persist := fs.Bool("persist", false, "declare the session: the daemon respawns it after reboot or crash")
@@ -61,20 +63,44 @@ func runSpawn(args []string) error {
 func runKeys(args []string) error {
 	fs := flags("keys", args)
 	enter := fs.Bool("enter", false, "press Enter after the text")
+	stdin := fs.Bool("stdin", false, "read text from stdin instead of argv")
+	raw := fs.Bool("raw", false, "send bytes without paste-mode heuristics")
 	fs.Parse2()
 	agent := fs.pos(0)
 	text := fs.body(1)
+	if *stdin {
+		if text != "" {
+			return fmt.Errorf("keys --stdin does not accept text arguments")
+		}
+		b, err := io.ReadAll(io.LimitReader(os.Stdin, (1<<20)+1))
+		if err != nil {
+			return err
+		}
+		if len(b) > 1<<20 {
+			return fmt.Errorf("stdin exceeds 1 MiB")
+		}
+		text = string(b)
+	}
 	if agent == "" || (text == "" && !*enter) {
-		return fmt.Errorf("usage: hive keys [--enter] <agent> <text...>")
+		return fmt.Errorf("usage: hive keys [--enter] [--stdin] [--raw] <agent> <text...>")
 	}
 	c, err := client.Resolve(*fs.net)
 	if err != nil {
 		return err
 	}
-	if err := c.Keys(agent, text, *enter); err != nil {
+	if *raw {
+		if err := c.KeysRaw(agent, text); err != nil {
+			return err
+		}
+		if *enter {
+			if err := c.Keys(agent, "", true); err != nil {
+				return err
+			}
+		}
+	} else if err := c.Keys(agent, text, *enter); err != nil {
 		return err
 	}
-	fmt.Printf("sent %d byte(s) to %s (enter=%v)\n", len(text), agent, *enter)
+	fmt.Printf("sent %d byte(s) to %s (enter=%v raw=%v)\n", len(text), agent, *enter, *raw)
 	return nil
 }
 

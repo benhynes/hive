@@ -6,7 +6,8 @@ package main
 // default-shell quoting maze — and files travel over scp/sftp instead
 // of stdin pipes. Control ops (spawn/read/keys/kill) work through the
 // Windows console backend (internal/control); pass --msg-only to
-// withhold the control token.
+// withhold the control token, or --local-control to mint one that is valid
+// only on the Windows node.
 
 import (
 	"encoding/base64"
@@ -25,10 +26,12 @@ import (
 )
 
 type winOpts struct {
-	name, bind, hub, dest, home, bin, src          string
-	port                                           int
-	msgOnly, persist, noStart, restart, noAnnounce bool
-	computer, goarch, profile                      string
+	name, bind, hub, dest, home, bin, src string
+	port                                  int
+	controlMode                           nodeControlMode
+	controlToken                          string
+	persist, noStart, restart, noAnnounce bool
+	computer, goarch, profile             string
 }
 
 // parseWinProbe splits `echo %OS% %COMPUTERNAME% %PROCESSOR_ARCHITECTURE%
@@ -84,8 +87,10 @@ func nodeInstallWindows(ssh sshRunner, cfg config.Config, netName string, nc con
 		return fmt.Errorf("node would be named %q, same as this host — pass --name", o.name)
 	}
 	layer := "control via the Windows console backend"
-	if o.msgOnly {
-		layer = "message-only (--msg-only)"
+	if o.controlMode == nodeControlNone {
+		layer = "message-only"
+	} else if o.controlMode == nodeControlLocal {
+		layer = "host-local control (--local-control)"
 	}
 	fmt.Printf("  windows/%s, node name %q — %s\n", o.goarch, o.name, layer)
 
@@ -154,8 +159,8 @@ func nodeInstallWindows(ssh sshRunner, cfg config.Config, netName string, nc con
 	warnLoopbackHub(cfg, hub)
 
 	// State files travel over scp — tokens never touch remote argv.
-	fmt.Printf("configuring: host_name=%s bind=%s port=%d net=%s msg_only=%v admin=%v\n",
-		o.name, o.bind, o.port, netName, o.msgOnly, admin)
+	fmt.Printf("configuring: host_name=%s bind=%s port=%d net=%s control=%s admin=%v\n",
+		o.name, o.bind, o.port, netName, o.controlMode, admin)
 	tmp, err := os.MkdirTemp("", "hive-win")
 	if err != nil {
 		return err
@@ -167,8 +172,9 @@ func nodeInstallWindows(ssh sshRunner, cfg config.Config, netName string, nc con
 		MsgToken: nc.MsgToken,
 		Hosts:    seedHosts(nc.Hosts, cfg.HostName, hub, o.name, o.port),
 	}
-	if !o.msgOnly {
-		nodeNet.ControlToken = nc.ControlToken
+	nodeNet.ControlToken = o.controlToken
+	if o.controlMode == nodeControlLocal {
+		nodeNet.ControlHost = o.name
 	}
 	nodeNetJSON, _ := json.MarshalIndent(nodeNet, "", "  ")
 	for _, f := range []struct {
@@ -263,8 +269,11 @@ func nodeInstallWindows(ssh sshRunner, cfg config.Config, netName string, nc con
 	fmt.Printf("\nnode %q is in the mesh:\n", o.name)
 	fmt.Printf("  hive agents                        # should reach @%s\n", o.name)
 	fmt.Printf("  hive send <agent>@%s ...\n", o.name)
-	if !o.msgOnly {
+	if o.controlMode == nodeControlShared {
 		fmt.Printf("  hive spawn --host %s <name> -- CMD...\n", o.name)
+	} else if o.controlMode == nodeControlLocal {
+		fmt.Printf("  on %s: hive spawn --grant-control <name> -- CMD...\n", o.name)
+		fmt.Printf("note: %s has host-local control; the original network control token cannot control it remotely\n", o.name)
 	}
 	if o.noStart {
 		// A plain `ssh <host> hive daemon` runs in the foreground and dies

@@ -4,7 +4,8 @@
 //	HIVE_ADDR  hub to talk to        (default http://127.0.0.1:<config port>)
 //	HIVE_NET   network name          (default: the sole local network)
 //	HIVE_TOKEN bearer for msg ops    (default: tokens from ~/.hive/nets/<net>/net.json)
-//	HIVE_CONTROL_TOKEN bearer for control ops (default: control token from net.json)
+//	HIVE_CONTROL_TOKEN bearer for control ops (default: control token from net.json only when HIVE_TOKEN is unset)
+//	HIVE_CONTROL_HOST  optional host binding for HIVE_CONTROL_TOKEN
 //	HIVE_AGENT our own agent id, informational
 package client
 
@@ -14,7 +15,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -30,16 +30,19 @@ type Client struct {
 	Net     string
 	Token   string // msg-layer bearer (agent token or net token)
 	Control string // control token if held
-	Agent   string // our own id (name@host) if known
-	hc      *http.Client
+	// ControlHost is empty for a network-wide control token. When set, the
+	// token must never be sent to a different hub.
+	ControlHost string
+	Agent       string // our own id (name@host) if known
+	hc          *http.Client
 
-	mu    sync.RWMutex      // guards self + hosts (dash reads concurrently)
+	mu    sync.RWMutex      // guards self + hosts (concurrent MCP tool calls read them)
 	self  string            // local hub's host name (lazy)
 	hosts map[string]string // local hub's hosts list (lazy)
 }
 
-// SetHTTPTimeout overrides the request timeout. Long-running pollers
-// (dash) use a short one so a black-holed host can't stall a poll loop.
+// SetHTTPTimeout overrides the request timeout. A caller that polls many
+// hosts can set a short one so a black-holed host can't stall a loop.
 // Not safe to call concurrently with in-flight requests.
 func (c *Client) SetHTTPTimeout(d time.Duration) { c.hc.Timeout = d }
 
@@ -83,16 +86,23 @@ func Resolve(netFlag string) (*Client, error) {
 		nc, haveNet = n, true
 	}
 	c.Token = os.Getenv("HIVE_TOKEN")
-	c.Control = os.Getenv("HIVE_CONTROL_TOKEN")
-	if (c.Token == "" || c.Control == "") && haveNet {
-		if c.Control == "" {
-			c.Control = nc.ControlToken
-		}
+	if envControl := os.Getenv("HIVE_CONTROL_TOKEN"); envControl != "" {
+		c.Control = envControl
+		c.ControlHost = os.Getenv("HIVE_CONTROL_HOST")
+	} else if haveNet && c.Token == "" {
+		// A personal HIVE_TOKEN marks an agent-scoped client. Never let that
+		// client silently inherit the operator's CONTROL capability from disk;
+		// hive spawn --grant-control supplies HIVE_CONTROL_TOKEN explicitly.
+		c.Control = nc.ControlToken
+		c.ControlHost = nc.ControlHost
+	}
+	if c.Token == "" && haveNet {
+		// Generic requests always use the least-privileged MSG credential.
+		// Keeping CONTROL separate also lets a legacy/shared-control hub talk
+		// to peers that have already rotated to independent local control.
+		c.Token = nc.MsgToken
 		if c.Token == "" {
 			c.Token = nc.ControlToken
-			if c.Token == "" {
-				c.Token = nc.MsgToken
-			}
 		}
 	}
 	if c.Token == "" {
@@ -112,11 +122,33 @@ func Resolve(netFlag string) (*Client, error) {
 	return c, nil
 }
 
-func (c *Client) controlToken() (string, error) {
-	if c.Control != "" {
-		return c.Control, nil
+func (c *Client) controlToken(host string) (string, error) {
+	if c.Control == "" {
+		return "", fmt.Errorf("control token required for host %q (set HIVE_CONTROL_TOKEN or hold it in net.json)", host)
 	}
-	return "", fmt.Errorf("control token required (set HIVE_CONTROL_TOKEN or hold it in net.json)")
+	if c.ControlHost != "" && host != c.ControlHost {
+		return "", fmt.Errorf("control token is scoped to host %q and cannot control host %q", c.ControlHost, host)
+	}
+	return c.Control, nil
+}
+
+// HasControl reports whether the client holds a direct control capability.
+func (c *Client) HasControl() bool {
+	return c.Control != ""
+}
+
+// CanControl reports whether this client holds a capability it may send to
+// host. It never reveals the capability value.
+func (c *Client) CanControl(host string) bool {
+	return c.Control != "" && (c.ControlHost == "" || c.ControlHost == host)
+}
+
+func (c *Client) localControlToken() (string, error) {
+	self, err := c.Self()
+	if err != nil {
+		return "", err
+	}
+	return c.controlToken(self)
 }
 
 func (c *Client) do(method, base, path, token string, in, out any) error {
@@ -181,7 +213,7 @@ func (c *Client) Hosts() (HostsResp, error) {
 }
 
 func (c *Client) HostsMod(op, name, addr string) (HostsResp, error) {
-	tok, err := c.controlToken()
+	tok, err := c.localControlToken()
 	if err != nil {
 		return HostsResp{}, err
 	}
@@ -189,6 +221,29 @@ func (c *Client) HostsMod(op, name, addr string) (HostsResp, error) {
 	err = c.do("POST", c.Addr, c.np("/hosts"), tok,
 		map[string]string{"op": op, "name": name, "addr": addr}, &out)
 	return out, err
+}
+
+// RotateControl replaces the local hub's control token. The hub persists the
+// new token before switching its in-memory authentication state and binds it
+// to its own host name.
+func (c *Client) RotateControl(newToken string) error {
+	tok, err := c.localControlToken()
+	if err != nil {
+		return err
+	}
+	var out struct {
+		ControlHost string `json:"control_host"`
+	}
+	if err := c.do("POST", c.Addr, c.np("/control/rotate"), tok,
+		map[string]string{"token": newToken}, &out); err != nil {
+		return err
+	}
+	if c.Token == c.Control {
+		c.Token = newToken
+	}
+	c.Control = newToken
+	c.ControlHost = out.ControlHost
+	return nil
 }
 
 // Self returns the local hub's host name.
@@ -286,8 +341,12 @@ func (c *Client) Deregister(name string) error {
 	// Deregistering someone else needs the control layer; an agent's own
 	// msg token only covers self-deregistration (empty name).
 	tok := c.Token
-	if name != "" && c.Control != "" {
-		tok = c.Control
+	if name != "" && c.HasControl() {
+		var err error
+		tok, err = c.localControlToken()
+		if err != nil {
+			return err
+		}
 	}
 	return c.do("POST", c.Addr, c.np("/deregister"), tok, map[string]string{"name": name}, nil)
 }
@@ -330,8 +389,12 @@ func (c *Client) Inbox(after int64, wait, max int, agent string) (ReadResult, er
 	}
 	var out ReadResult
 	tok := c.Token
-	if agent != "" && c.Control != "" {
-		tok = c.Control
+	if agent != "" && c.HasControl() {
+		var err error
+		tok, err = c.localControlToken()
+		if err != nil {
+			return out, err
+		}
 	}
 	err := c.do("GET", c.Addr, c.np("/inbox")+q, tok, nil, &out)
 	return out, err
@@ -449,14 +512,15 @@ type SpawnResp struct {
 }
 
 func (c *Client) Spawn(host, name string, cmd []string, cwd string, grantControl, waitReady, headed, persist bool) (SpawnResp, error) {
-	tok, err := c.controlToken()
-	if err != nil {
-		return SpawnResp{}, err
-	}
+	var err error
 	if host == "" {
 		if host, err = c.Self(); err != nil {
 			return SpawnResp{}, err
 		}
+	}
+	tok, err := c.controlToken(host)
+	if err != nil {
+		return SpawnResp{}, err
 	}
 	base, err := c.hubFor(host)
 	if err != nil {
@@ -473,15 +537,15 @@ func (c *Client) Spawn(host, name string, cmd []string, cwd string, grantControl
 
 // controlTarget resolves an agent id to (hubBase, fullID).
 func (c *Client) controlTarget(agent string) (string, string, string, error) {
-	tok, err := c.controlToken()
-	if err != nil {
-		return "", "", "", err
-	}
 	full, err := c.ExpandAgent(agent)
 	if err != nil {
 		return "", "", "", err
 	}
 	_, host, err := proto.SplitAgent(full)
+	if err != nil {
+		return "", "", "", err
+	}
+	tok, err := c.controlToken(host)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -509,46 +573,6 @@ func (c *Client) keys(agent, text string, enter, raw bool) error {
 	}
 	return c.do("POST", base, c.np("/keys"), tok,
 		map[string]any{"agent": full, "text": text, "enter": enter, "raw": raw}, nil)
-}
-
-// StreamResp is a live pane-output stream: the screen snapshot, then
-// raw output until closed. Callers must Close the Body.
-type StreamResp struct {
-	Body       io.ReadCloser
-	Cols, Rows int
-}
-
-// Stream opens a live output stream for an agent's pane. It uses a
-// dedicated non-timing-out HTTP client — the shared one's Timeout
-// covers the whole response body and would sever the stream.
-func (c *Client) Stream(agent string) (*StreamResp, error) {
-	base, full, tok, err := c.controlTarget(agent)
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequest("GET", base+c.np("/stream?agent="+url.QueryEscape(full)), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-	resp, err := (&http.Client{}).Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != 200 {
-		var e struct {
-			Error string `json:"error"`
-		}
-		json.NewDecoder(resp.Body).Decode(&e)
-		resp.Body.Close()
-		if e.Error == "" {
-			e.Error = resp.Status
-		}
-		return nil, fmt.Errorf("%s", e.Error)
-	}
-	cols, _ := strconv.Atoi(resp.Header.Get("X-Hive-Cols"))
-	rows, _ := strconv.Atoi(resp.Header.Get("X-Hive-Rows"))
-	return &StreamResp{Body: resp.Body, Cols: cols, Rows: rows}, nil
 }
 
 func (c *Client) Read(agent string, lines int) (string, error) {

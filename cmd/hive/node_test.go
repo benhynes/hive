@@ -1,6 +1,50 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"github.com/benhynes/hive/internal/config"
+)
+
+func TestSelectNodeControl(t *testing.T) {
+	nc := config.NetConfig{MsgToken: strings.Repeat("a", 64), ControlToken: strings.Repeat("b", 64)}
+
+	mode, tok, err := selectNodeControl(nc, false, false)
+	if err != nil || mode != nodeControlShared || tok != nc.ControlToken {
+		t.Fatalf("default = %v %q %v, want shared source token", mode, tok, err)
+	}
+	mode, tok, err = selectNodeControl(nc, true, false)
+	if err != nil || mode != nodeControlNone || tok != "" {
+		t.Fatalf("msg-only = %v %q %v", mode, tok, err)
+	}
+	if _, _, err := selectNodeControl(nc, true, true); err == nil {
+		t.Fatal("--msg-only with --local-control was accepted")
+	}
+
+	mode, first, err := selectNodeControl(nc, false, true)
+	if err != nil || mode != nodeControlLocal || len(first) != 64 {
+		t.Fatalf("local-control = %v %q %v", mode, first, err)
+	}
+	_, second, _ := selectNodeControl(nc, false, true)
+	if first == nc.ControlToken || first == nc.MsgToken || first == second {
+		t.Fatal("local-control token was not fresh and independent")
+	}
+}
+
+func TestSelectNodeControlDoesNotCopyLocalSource(t *testing.T) {
+	nc := config.NetConfig{
+		MsgToken: "msg", ControlToken: "host-a-token", ControlHost: "host-a",
+	}
+	mode, tok, err := selectNodeControl(nc, false, false)
+	if err != nil || mode != nodeControlNone || tok != "" {
+		t.Fatalf("local source default = %v %q %v, want msg-only", mode, tok, err)
+	}
+	mode, tok, err = selectNodeControl(nc, false, true)
+	if err != nil || mode != nodeControlLocal || tok == "" || tok == nc.ControlToken {
+		t.Fatalf("explicit local child = %v %q %v", mode, tok, err)
+	}
+}
 
 func TestPlatformOf(t *testing.T) {
 	cases := []struct {

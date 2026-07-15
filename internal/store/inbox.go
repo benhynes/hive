@@ -264,6 +264,15 @@ func (ib *Inbox) Lag() int64 {
 	return (ib.nextSeq - 1) - ib.cursor
 }
 
+// Latest returns the highest seq ever appended (0 if empty). The nudge
+// engine keys re-arming on this: a bump past the last-nudged latest means
+// genuinely new mail, distinct from mail we've already announced.
+func (ib *Inbox) Latest() int64 {
+	ib.mu.Lock()
+	defer ib.mu.Unlock()
+	return ib.nextSeq - 1
+}
+
 // Wait blocks until a record with seq > after exists or ctx is done,
 // then returns the read. It counts as a live poller while blocked.
 func (ib *Inbox) Wait(ctx context.Context, after int64, max int) ReadResult {

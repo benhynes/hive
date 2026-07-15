@@ -32,16 +32,6 @@ func main() {
 		err = runDeregister(args)
 	case "agents":
 		err = runAgents(args)
-	case "send":
-		err = runSend(args)
-	case "recv":
-		err = runRecv(args)
-	case "ask":
-		err = runAsk(args)
-	case "asks":
-		err = runAsks(args)
-	case "answer":
-		err = runAnswer(args)
 	case "hosts":
 		err = runHosts(args)
 	case "node":
@@ -54,8 +44,8 @@ func main() {
 		err = runRead(args)
 	case "kill":
 		err = runKill(args)
-	case "dash":
-		err = runDash(args)
+	case "mcp":
+		err = runMCP(args)
 	case "__conop":
 		// Hidden Windows console-op helper the daemon re-execs itself
 		// as; see internal/control/conop_windows.go.
@@ -104,6 +94,7 @@ func runDaemon(args []string) error {
 	defer stop()
 	fmt.Printf("hive daemon: host=%s listening on %s:%d\n", cfg.HostName, cfg.Bind, cfg.Port)
 	go h.Reconcile(ctx)
+	go h.SweepNudges(ctx)
 	return h.ListenAndServe(ctx)
 }
 
@@ -118,23 +109,28 @@ NETWORKS
   hive net join <name> --hub ADDR --msg-token T [--control-token T]
   hive net list                            list local networks
   hive net show <name>                     show tokens + hosts
+  hive net rotate-control <name>           replace this hub's control token with a host-local token
 
-MESSAGING (msg layer; flags before positionals)
+IDENTITY
   hive register --name N [--pane %ID]      register self, prints export lines
   hive deregister [name]
   hive agents [--local] [--json]           list agents across the mesh
-  hive send <to|@all> <body...>            to = name[@host]
-  hive recv [--wait N] [--follow] [--json] [--no-ack]   read + ack own inbox
-  hive ask [--timeout S] <to> <question...>  send question, wait for answer
-  hive asks                                list questions waiting on you
-  hive answer <ask-id> <body...>           answer a question
+
+MESSAGING is MCP-only — agents send/recv/ask/answer via the hive_* tools.
+  hive mcp [--list]                        stdio MCP server: hive_send, hive_recv,
+                                           hive_ask, hive_answer, hive_asks,
+                                           hive_agents (+ spawn/keys/read/kill
+                                           when the agent holds control).
+                                           Register once per agent:
+                                             claude mcp add hive -- hive mcp
+                                           --list prints the tools and exits.
 
 HOSTS (control layer)
   hive hosts list
   hive hosts add <name> <addr:port>
   hive hosts rm <name>
   hive node install [--name N] [--bind IP] [--port N] [--hub A:P] [--persist]
-                    [--msg-only] [--restart] [--no-start] <ssh-target>
+                    [--msg-only|--local-control] [--restart] [--no-start] <ssh-target>
                                            bootstrap a new host over ssh
 
 CONTROL (control layer; goes direct to the target host)
@@ -143,12 +139,8 @@ CONTROL (control layer; goes direct to the target host)
   hive keys [--enter] <agent> <text...>
   hive read [--lines N] <agent>
   hive kill [--forget] <agent>            --forget drops the persist declaration too
-  hive dash [--web] [--bind A] [--port N] [--open=false]
-                                           web dashboard: live grid of every
-                                           agent's screen + status, zoom to
-                                           type into one (default :7780)
 
-Config: HIVE_ADDR HIVE_NET HIVE_TOKEN HIVE_CONTROL_TOKEN HIVE_AGENT
+Config: HIVE_ADDR HIVE_NET HIVE_TOKEN HIVE_CONTROL_TOKEN HIVE_CONTROL_HOST HIVE_AGENT
         (per-host: ~/.hive/config.json; per-net: ~/.hive/nets/<net>/)
 `)
 }
