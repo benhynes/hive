@@ -344,9 +344,21 @@ All five are settled; integration follows these.
   Deferred within P1 scope: `repo` clone (P2, where SSH provisioning lands) and
   the reconcile/respawn path does not re-provision (the on-disk `.mcp.json` +
   trust survive, so respawned agents keep their wiring).
-- **P2 — SSH host bring-up:** `hosts add-ssh`, version-pinned binary ship,
-  transient daemon over SSH, port allocator + tunnel manager, forward-spawn.
-  Reuse node.go shipping. e2e against an OrbStack/tart VM.
+- **P2 — SSH host bring-up: DONE (2026-07-14).** `hive hosts add-ssh` /
+  `rm-ssh`; the SSH runner promoted to `internal/sshx` (shared by CLI + hub);
+  `internal/hub/sshhosts.go` brings up a transient remote daemon over the SSH
+  ControlMaster, allocates loopback ports, wires `-L`/`-R` forwards, mints a
+  host-local control token for the remote, and forward-spawns (with the
+  profile resolved on the origin into a self-contained provision spec). The
+  hub owns lifecycle; teardown on `rm-ssh` and daemon shutdown (warm by
+  default). **e2e-verified** (`TestSSHHostSpawnE2E`) through an ssh shim +
+  socat standing in for real `ssh -L`/`-R` on loopback: register → first-spawn
+  bring-up → forward-spawn → cross-hub delivery to the SSH-hosted agent, all
+  through the tunnel. Deferred to P3: warm/idle timeout + reconnect, and
+  control-op (read/keys/kill) transparency from a third-party client. Not yet
+  run against a real second machine (the design's "OrbStack/tart VM" check) —
+  the shim proves the orchestration; real-SSH transport is what `sshx`/`node
+  install` already ship.
 - **P3 — lifecycle + control transparency:** warm/idle teardown, health-poll +
   reconnect (the hard part — rebuild ControlMaster + restart remote daemon,
   re-adopting persisted agents), audit; confirm read/keys/kill route through the

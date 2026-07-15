@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/benhynes/hive/internal/config"
+	"github.com/benhynes/hive/internal/sshx"
 )
 
 func TestSelectNodeControl(t *testing.T) {
@@ -59,9 +60,9 @@ func TestPlatformOf(t *testing.T) {
 		{"Linux", "riscv64", "", "", true},
 	}
 	for _, c := range cases {
-		goos, goarch, err := platformOf(c.s, c.m)
+		goos, goarch, err := sshx.PlatformOf(c.s, c.m)
 		if (err != nil) != c.wantErr || goos != c.goos || goarch != c.goarch {
-			t.Errorf("platformOf(%q,%q) = %q,%q,%v", c.s, c.m, goos, goarch, err)
+			t.Errorf("sshx.PlatformOf(%q,%q) = %q,%q,%v", c.s, c.m, goos, goarch, err)
 		}
 	}
 }
@@ -127,16 +128,16 @@ func TestWinPS(t *testing.T) {
 }
 
 func TestRemotePath(t *testing.T) {
-	if p, err := remotePath("~/.local/bin/hive"); err != nil || p != "$HOME/.local/bin/hive" {
+	if p, err := sshx.RemotePath("~/.local/bin/hive"); err != nil || p != "$HOME/.local/bin/hive" {
 		t.Errorf("tilde expansion: %q %v", p, err)
 	}
-	if _, err := remotePath(`$HOME/bin"; rm -rf /; "`); err == nil {
+	if _, err := sshx.RemotePath(`$HOME/bin"; rm -rf /; "`); err == nil {
 		t.Error("quote injection accepted")
 	}
-	if _, err := remotePath("$HOME/with space/hive"); err == nil {
+	if _, err := sshx.RemotePath("$HOME/with space/hive"); err == nil {
 		t.Error("space accepted")
 	}
-	if p, err := remotePath("/usr/local/bin/hive"); err != nil || p != "/usr/local/bin/hive" {
+	if p, err := sshx.RemotePath("/usr/local/bin/hive"); err != nil || p != "/usr/local/bin/hive" {
 		t.Errorf("absolute path: %q %v", p, err)
 	}
 }

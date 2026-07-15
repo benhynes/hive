@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/benhynes/hive/internal/client"
+	"github.com/benhynes/hive/internal/config"
 )
 
 func runHosts(args []string) error {
@@ -14,12 +15,39 @@ func runHosts(args []string) error {
 		sub, rest = args[0], args[1:]
 	}
 	fs := flags("hosts "+sub, rest)
+	profile := fs.String("profile", "", "default spawn profile for this SSH host")
+	home := fs.String("home", "", "remote HIVE_HOME (default ~/.hive)")
+	identity := fs.String("identity", "", "ssh key path")
+	binPath := fs.String("bin", "", "local path to a target-platform hive binary (else self-copy)")
+	port := fs.Int("port", 0, "remote daemon loopback port (default 7777)")
 	fs.Parse2()
 	c, err := client.Resolve(*fs.net)
 	if err != nil {
 		return err
 	}
 	switch sub {
+	case "add-ssh":
+		name, target := fs.pos(0), fs.pos(1)
+		if name == "" || target == "" {
+			return fmt.Errorf("usage: hive hosts add-ssh [--profile P] [--home DIR] [--port N] [--identity KEY] [--bin PATH] <name> <ssh-target>")
+		}
+		if err := c.AddSSHHost(name, config.SSHHost{
+			Target: target, Port: *port, Home: *home, Bin: *binPath, Identity: *identity, Profile: *profile,
+		}); err != nil {
+			return err
+		}
+		fmt.Printf("registered SSH host %s -> %s (brought up on first spawn)\n", name, target)
+		return nil
+	case "rm-ssh":
+		name := fs.pos(0)
+		if name == "" {
+			return fmt.Errorf("usage: hive hosts rm-ssh <name>")
+		}
+		if err := c.RemoveSSHHost(name); err != nil {
+			return err
+		}
+		fmt.Printf("removed SSH host %s (tunnel + transient daemon torn down)\n", name)
+		return nil
 	case "list":
 		res, err := c.Hosts()
 		if err != nil {

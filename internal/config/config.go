@@ -29,6 +29,20 @@ type NetConfig struct {
 	// original network-wide token behavior for existing configurations.
 	ControlHost string            `json:"control_host,omitempty"`
 	Hosts       map[string]string `json:"hosts"` // host name -> "addr:port"
+	// SSHHosts are lightweight on-demand hosts reached over SSH tunnels
+	// (docs/ssh-hosts-design.md). Local to this hub, like Hosts — no sync.
+	SSHHosts map[string]SSHHost `json:"ssh_hosts,omitempty"`
+}
+
+// SSHHost is one registered SSH target: an on-demand host brought up with a
+// transient loopback daemon at first spawn, no permanent install.
+type SSHHost struct {
+	Target   string `json:"target"`             // user@host or an ssh_config alias
+	Port     int    `json:"port,omitempty"`     // remote daemon loopback port (default 7777)
+	Home     string `json:"home,omitempty"`     // remote HIVE_HOME (default ~/.hive)
+	Bin      string `json:"bin,omitempty"`      // local path to a target-platform hive binary (default: self-copy, platforms must match)
+	Identity string `json:"identity,omitempty"` // ssh key path
+	Profile  string `json:"profile,omitempty"`  // default spawn profile
 }
 
 // ControlFor returns this configuration's control token only when it is

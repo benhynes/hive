@@ -53,6 +53,7 @@ type Hub struct {
 	mu     sync.Mutex
 	nets   map[string]*network
 	client *http.Client // hub->hub calls
+	ssh    *sshManager  // on-demand SSH hosts (transient remote daemons over tunnels)
 }
 
 type network struct {
@@ -83,12 +84,18 @@ type network struct {
 
 // New creates a hub for the given host config.
 func New(cfg config.Config) *Hub {
-	return &Hub{
+	h := &Hub{
 		Cfg:    cfg,
 		nets:   map[string]*network{},
 		client: &http.Client{Timeout: 3500 * time.Millisecond},
 	}
+	h.ssh = newSSHManager(h)
+	return h
 }
+
+// Shutdown releases hub-owned external resources: SSH-host tunnels and their
+// transient remote daemons. Call it when the daemon stops.
+func (h *Hub) Shutdown() { h.ssh.shutdown() }
 
 // net lazily loads a network from disk, so `hive net create/join` while
 // the daemon runs needs no reload step.

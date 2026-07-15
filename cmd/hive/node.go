@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -20,6 +19,7 @@ import (
 
 	"github.com/benhynes/hive/internal/config"
 	"github.com/benhynes/hive/internal/proto"
+	"github.com/benhynes/hive/internal/sshx"
 )
 
 func runNode(args []string) error {
@@ -121,16 +121,16 @@ func nodeInstall(args []string) error {
 	// all daemon lifecycle actions.
 	effectiveRestart := *restart || controlMode == nodeControlLocal
 
-	ssh, sshCleanup := newSSHRunner(target)
+	ssh, sshCleanup := sshx.NewRunner(target)
 	defer sshCleanup()
 
 	// 1. What are we installing onto?
 	fmt.Printf("probing %s ...\n", target)
-	out, uerr := ssh.run(nil, `uname -s -n -m`)
+	out, uerr := ssh.Run(nil, `uname -s -n -m`)
 	if uerr != nil {
 		// No POSIX shell — Windows OpenSSH (cmd or powershell default
 		// shell) answers this probe instead.
-		if wout, werr := ssh.run(nil, `cmd /c "echo %OS% %COMPUTERNAME% %PROCESSOR_ARCHITECTURE% %USERPROFILE%"`); werr == nil {
+		if wout, werr := ssh.Run(nil, `cmd /c "echo %OS% %COMPUTERNAME% %PROCESSOR_ARCHITECTURE% %USERPROFILE%"`); werr == nil {
 			comp, arch, profile, perr := parseWinProbe(wout)
 			if perr != nil {
 				return fmt.Errorf("target answers cmd but not a usable Windows probe: %v", perr)
@@ -150,7 +150,7 @@ func nodeInstall(args []string) error {
 	if len(f) < 3 {
 		return fmt.Errorf("unexpected uname output %q", out)
 	}
-	goos, goarch, err := platformOf(f[0], f[2])
+	goos, goarch, err := sshx.PlatformOf(f[0], f[2])
 	if err != nil {
 		return err
 	}
@@ -171,11 +171,11 @@ func nodeInstall(args []string) error {
 	if *home == "" {
 		*home = "$HOME/.hive"
 	}
-	destPath, err := remotePath(*dest)
+	destPath, err := sshx.RemotePath(*dest)
 	if err != nil {
 		return err
 	}
-	homePath, err := remotePath(*home)
+	homePath, err := sshx.RemotePath(*home)
 	if err != nil {
 		return err
 	}
@@ -206,13 +206,13 @@ func nodeInstall(args []string) error {
 	script := fmt.Sprintf(
 		`sh -c 'set -e; mkdir -p "%s"; cat > "%s.tmp"; chmod 755 "%s.tmp"; mv "%s.tmp" "%s"'`,
 		destDir, destPath, destPath, destPath, destPath)
-	if _, err := ssh.run(bf, script); err != nil {
+	if _, err := ssh.Run(bf, script); err != nil {
 		return err
 	}
 
 	// 4. Where does the node's daemon listen, and where do we?
 	if *bind == "" {
-		out, _ := ssh.run(nil, `sh -c 'tailscale ip -4 2>/dev/null | head -n1 || true'`)
+		out, _ := ssh.Run(nil, `sh -c 'tailscale ip -4 2>/dev/null | head -n1 || true'`)
 		*bind = strings.TrimSpace(out)
 		if *bind == "" {
 			return fmt.Errorf("cannot detect the node's tailscale IPv4 — pass --bind ADDR")
@@ -231,7 +231,7 @@ func nodeInstall(args []string) error {
 	fmt.Printf("configuring: host_name=%s bind=%s port=%d net=%s control=%s\n",
 		*name, *bind, *port, netName, controlMode)
 	nodeCfg, _ := json.MarshalIndent(config.Config{HostName: *name, Bind: *bind, Port: *port}, "", "  ")
-	if err := writeRemote(ssh, homePath, homePath+"/config.json", nodeCfg); err != nil {
+	if err := ssh.WriteRemote(homePath, homePath+"/config.json", nodeCfg); err != nil {
 		return err
 	}
 	nodeNet := config.NetConfig{
@@ -244,7 +244,7 @@ func nodeInstall(args []string) error {
 		nodeNet.ControlHost = *name
 	}
 	nodeNetJSON, _ := json.MarshalIndent(nodeNet, "", "  ")
-	if err := writeRemote(ssh, homePath+"/nets/"+netName, homePath+"/nets/"+netName+"/net.json", nodeNetJSON); err != nil {
+	if err := ssh.WriteRemote(homePath+"/nets/"+netName, homePath+"/nets/"+netName+"/net.json", nodeNetJSON); err != nil {
 		return err
 	}
 
@@ -266,7 +266,7 @@ func nodeInstall(args []string) error {
 		// A local-control reinstall rotates the accepted token. Leaving an
 		// existing daemon alive would leave the old capability active and the
 		// new on-disk token unusable until a later restart.
-		if _, err := ssh.run(nil, `sh -c 'pkill -f "[h]ive daemon" || true; sleep 0.3'`); err != nil {
+		if _, err := ssh.Run(nil, `sh -c 'pkill -f "[h]ive daemon" || true; sleep 0.3'`); err != nil {
 			return err
 		}
 		fmt.Println("daemon stopped so the rotated control token takes effect on next start")
@@ -276,12 +276,12 @@ func nodeInstall(args []string) error {
 			fmt.Println("daemon already running — the old binary stays in memory (pass --restart to upgrade)")
 		} else {
 			if running {
-				ssh.run(nil, `sh -c 'pkill -f "[h]ive daemon" || true; sleep 0.3'`)
+				ssh.Run(nil, `sh -c 'pkill -f "[h]ive daemon" || true; sleep 0.3'`)
 			}
 			startCmd := fmt.Sprintf(
 				`sh -c 'HIVE_HOME="%s" nohup "%s" daemon >> "%s/daemon.log" 2>&1 < /dev/null &'`,
 				homePath, destPath, homePath)
-			if _, err := ssh.run(nil, startCmd); err != nil {
+			if _, err := ssh.Run(nil, startCmd); err != nil {
 				return err
 			}
 			if err := waitHealthy(nodeURL, hint); err != nil {
@@ -369,8 +369,8 @@ const launchdPlist = `<?xml version="1.0" encoding="UTF-8"?>
 // persistNode installs a supervisor for the node's daemon and (when
 // startNow) hands the running daemon over to it. Unit files need
 // absolute paths, so the node's $HOME is resolved first.
-func persistNode(ssh sshRunner, goos, dest, home string, startNow bool) (string, error) {
-	out, err := ssh.run(nil, `sh -c 'echo "$HOME"'`)
+func persistNode(ssh sshx.Runner, goos, dest, home string, startNow bool) (string, error) {
+	out, err := ssh.Run(nil, `sh -c 'echo "$HOME"'`)
 	if err != nil {
 		return "", err
 	}
@@ -390,11 +390,11 @@ func persistNode(ssh sshRunner, goos, dest, home string, startNow bool) (string,
 // from the node's home, then unions in the node's login-shell PATH (which
 // sources ~/.zprofile, so a nonstandard Homebrew/claude prefix is picked
 // up too) when the probe yields one.
-func launchdPATH(ssh sshRunner, home string) string {
+func launchdPATH(ssh sshx.Runner, home string) string {
 	base := "/opt/homebrew/bin:/opt/homebrew/sbin:" + home + "/.local/bin:" + home + "/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 	// Login-shell PATH probe; \$PATH is escaped so the outer sh -c leaves it
 	// for the login shell to expand. Best-effort — base alone already works.
-	out, err := ssh.run(nil, `sh -c 'S=${SHELL:-/bin/sh}; "$S" -lc "printf %s \"\$PATH\"" 2>/dev/null'`)
+	out, err := ssh.Run(nil, `sh -c 'S=${SHELL:-/bin/sh}; "$S" -lc "printf %s \"\$PATH\"" 2>/dev/null'`)
 	login := strings.TrimSpace(out)
 	path := base
 	if err == nil && strings.Contains(login, "/") {
@@ -412,11 +412,11 @@ func xmlEscape(s string) string {
 	return s
 }
 
-func persistSystemd(ssh sshRunner, dest, home string, startNow bool) (string, error) {
-	if out, _ := ssh.run(nil, `sh -c '[ -d /run/systemd/system ] && command -v systemctl >/dev/null && echo yes || true'`); !strings.Contains(out, "yes") {
+func persistSystemd(ssh sshx.Runner, dest, home string, startNow bool) (string, error) {
+	if out, _ := ssh.Run(nil, `sh -c '[ -d /run/systemd/system ] && command -v systemctl >/dev/null && echo yes || true'`); !strings.Contains(out, "yes") {
 		return "", fmt.Errorf("--persist needs systemd on the node (not running there); start the daemon your own way or drop --persist")
 	}
-	out, err := ssh.run(nil, `sh -c 'if [ "$(id -u)" = 0 ]; then echo root; elif sudo -n true 2>/dev/null; then echo sudo; else echo user; fi; id -un'`)
+	out, err := ssh.Run(nil, `sh -c 'if [ "$(id -u)" = 0 ]; then echo root; elif sudo -n true 2>/dev/null; then echo sudo; else echo user; fi; id -un'`)
 	if err != nil {
 		return "", err
 	}
@@ -432,16 +432,16 @@ func persistSystemd(ssh sshRunner, dest, home string, startNow bool) (string, er
 	}
 	if mode == "user" {
 		unit := fmt.Sprintf(systemdUserUnit, home, dest)
-		if err := writeRemote(ssh, "$HOME/.config/systemd/user", "$HOME/.config/systemd/user/hive.service", []byte(unit)); err != nil {
+		if err := ssh.WriteRemote("$HOME/.config/systemd/user", "$HOME/.config/systemd/user/hive.service", []byte(unit)); err != nil {
 			return "", err
 		}
 		script := fmt.Sprintf(
 			`sh -c 'set -e; export XDG_RUNTIME_DIR="/run/user/$(id -u)"; systemctl --user daemon-reload; pkill -f "[h]ive daemon" 2>/dev/null || true; systemctl --user enable%s hive; loginctl enable-linger "$(id -un)" 2>/dev/null || true'`, now)
-		if _, err := ssh.run(nil, script); err != nil {
+		if _, err := ssh.Run(nil, script); err != nil {
 			return "", err
 		}
 		desc := "systemd user unit (~/.config/systemd/user/hive.service)"
-		if lo, _ := ssh.run(nil, `sh -c 'loginctl show-user "$(id -un)" -p Linger 2>/dev/null || true'`); !strings.Contains(lo, "Linger=yes") {
+		if lo, _ := ssh.Run(nil, `sh -c 'loginctl show-user "$(id -un)" -p Linger 2>/dev/null || true'`); !strings.Contains(lo, "Linger=yes") {
 			desc += " — WARNING: lingering is off, so it only runs while you're logged in (a root shell can fix it: loginctl enable-linger " + user + ")"
 		}
 		return desc, nil
@@ -452,25 +452,25 @@ func persistSystemd(ssh sshRunner, dest, home string, startNow bool) (string, er
 		pre = "sudo "
 	}
 	unit := fmt.Sprintf(systemdSystemUnit, user, home, dest)
-	if err := writeRemote(ssh, "/tmp", "/tmp/hive.service.tmp", []byte(unit)); err != nil {
+	if err := ssh.WriteRemote("/tmp", "/tmp/hive.service.tmp", []byte(unit)); err != nil {
 		return "", err
 	}
 	script := fmt.Sprintf(
 		`sh -c 'set -e; %smv /tmp/hive.service.tmp /etc/systemd/system/hive.service; %schmod 644 /etc/systemd/system/hive.service; %ssystemctl daemon-reload; pkill -f "[h]ive daemon" 2>/dev/null || true; %ssystemctl enable%s hive'`,
 		pre, pre, pre, pre, now)
-	if _, err := ssh.run(nil, script); err != nil {
+	if _, err := ssh.Run(nil, script); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("systemd system unit (/etc/systemd/system/hive.service, User=%s, via %s)", user, mode), nil
 }
 
-func persistLaunchd(ssh sshRunner, dest, home, userHome string) (string, error) {
+func persistLaunchd(ssh sshx.Runner, dest, home, userHome string) (string, error) {
 	plist := fmt.Sprintf(launchdPlist, dest, home, launchdPATH(ssh, userHome), home, home)
-	if err := writeRemote(ssh, "$HOME/Library/LaunchAgents", "$HOME/Library/LaunchAgents/com.hive.daemon.plist", []byte(plist)); err != nil {
+	if err := ssh.WriteRemote("$HOME/Library/LaunchAgents", "$HOME/Library/LaunchAgents/com.hive.daemon.plist", []byte(plist)); err != nil {
 		return "", err
 	}
 	script := `sh -c 'set -e; pkill -f "[h]ive daemon" 2>/dev/null || true; launchctl bootout "gui/$(id -u)/com.hive.daemon" 2>/dev/null || true; launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.hive.daemon.plist" 2>/dev/null || launchctl load -w "$HOME/Library/LaunchAgents/com.hive.daemon.plist"'`
-	if _, err := ssh.run(nil, script); err != nil {
+	if _, err := ssh.Run(nil, script); err != nil {
 		return "", fmt.Errorf("%v — a LaunchAgent needs a logged-in user session; it will activate at next login", err)
 	}
 	return "launchd agent (~/Library/LaunchAgents/com.hive.daemon.plist)", nil
@@ -501,67 +501,11 @@ func resolveNetConfig(netFlag string) (string, config.NetConfig, error) {
 	return name, nc, nil
 }
 
-// sshRunner shells out to ssh with batch-mode settings; the command is
+// sshx.Runner shells out to ssh with batch-mode settings; the command is
 // one string parsed by the remote shell (we only ever wrap POSIX
 // sh -c '...' scripts that contain no single quotes). When ctlPath is set,
 // every run/scp shares one multiplexed connection (ControlMaster), so an
 // install's 6-11 steps pay a single handshake instead of one each.
-type sshRunner struct {
-	target  string
-	ctlPath string
-}
-
-// newSSHRunner builds a runner backed by an SSH ControlMaster so all the
-// install's ssh/scp invocations reuse one connection. The cleanup closes
-// the master (ssh -O exit) and removes the socket dir; call it via defer.
-// If a temp dir can't be made it degrades to unmultiplexed ssh.
-func newSSHRunner(target string) (sshRunner, func()) {
-	dir, err := os.MkdirTemp("/tmp", "hive-cm")
-	if err != nil {
-		return sshRunner{target: target}, func() {}
-	}
-	ctl := dir + "/s" // short: the ControlPath socket must fit sun_path (~104)
-	cleanup := func() {
-		exec.Command("ssh", "-o", "ControlPath="+ctl, "-O", "exit", target).Run()
-		os.RemoveAll(dir)
-	}
-	return sshRunner{target: target, ctlPath: ctl}, cleanup
-}
-
-func (s sshRunner) opts() []string {
-	o := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=10"}
-	if s.ctlPath != "" {
-		o = append(o, "-o", "ControlMaster=auto", "-o", "ControlPath="+s.ctlPath, "-o", "ControlPersist=30s")
-	}
-	return o
-}
-
-func (s sshRunner) run(stdin *os.File, cmd string) (string, error) {
-	c := exec.Command("ssh", append(s.opts(), s.target, cmd)...)
-	if stdin != nil {
-		c.Stdin = stdin
-	}
-	var out, errb strings.Builder
-	c.Stdout, c.Stderr = &out, &errb
-	if err := c.Run(); err != nil {
-		return "", fmt.Errorf("ssh %s: %v: %s", s.target, err, strings.TrimSpace(errb.String()))
-	}
-	return out.String(), nil
-}
-
-// scp copies a local file to a remote path over the sftp channel (works
-// on Windows OpenSSH too, where there is no POSIX shell to pipe into).
-func (s sshRunner) scp(local, remote string) error {
-	remote = strings.ReplaceAll(remote, `\`, `/`)
-	c := exec.Command("scp", append(s.opts(), "-q", local, s.target+":"+remote)...)
-	var errb strings.Builder
-	c.Stderr = &errb
-	if err := c.Run(); err != nil {
-		return fmt.Errorf("scp to %s:%s: %v: %s", s.target, remote, err, strings.TrimSpace(errb.String()))
-	}
-	return nil
-}
-
 // resolveHubAddr is this hub's address as reachable from the node:
 // the flag if given, else the local tailscale IPv4 + configured port.
 func resolveHubAddr(cfg config.Config, flag string) (string, error) {
@@ -636,59 +580,6 @@ func announceAll(cfg config.Config, netName string, nc config.NetConfig, nodeNam
 		}
 	}
 	return nil
-}
-
-// writeRemote streams content into a remote file under dir, 0600, via
-// the ssh channel (never argv).
-func writeRemote(ssh sshRunner, dir, path string, content []byte) error {
-	r, w, err := os.Pipe()
-	if err != nil {
-		return err
-	}
-	go func() {
-		w.Write(content)
-		w.Close()
-	}()
-	defer r.Close()
-	script := fmt.Sprintf(`sh -c 'set -e; umask 077; mkdir -p "%s"; cat > "%s"'`, dir, path)
-	_, err = ssh.run(r, script)
-	return err
-}
-
-var remotePathRe = regexp.MustCompile(`^[A-Za-z0-9_./$-]+$`)
-
-// remotePath normalizes a --dest/--home value for safe embedding in a
-// double-quoted remote sh script. Leading ~/ becomes $HOME/.
-func remotePath(p string) (string, error) {
-	if rest, ok := strings.CutPrefix(p, "~/"); ok {
-		p = "$HOME/" + rest
-	}
-	if !remotePathRe.MatchString(p) {
-		return "", fmt.Errorf("remote path %q may only contain [A-Za-z0-9_./$-]", p)
-	}
-	return p, nil
-}
-
-// platformOf maps uname output to GOOS/GOARCH.
-func platformOf(unameS, unameM string) (string, string, error) {
-	var goos, goarch string
-	switch strings.ToLower(unameS) {
-	case "linux":
-		goos = "linux"
-	case "darwin":
-		goos = "darwin"
-	default:
-		return "", "", fmt.Errorf("unsupported node OS %q", unameS)
-	}
-	switch strings.ToLower(unameM) {
-	case "x86_64", "amd64":
-		goarch = "amd64"
-	case "aarch64", "arm64":
-		goarch = "arm64"
-	default:
-		return "", "", fmt.Errorf("unsupported node arch %q", unameM)
-	}
-	return goos, goarch, nil
 }
 
 // crossCompile builds cmd/hive for the target platform from src, which

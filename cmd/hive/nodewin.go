@@ -23,6 +23,7 @@ import (
 
 	"github.com/benhynes/hive/internal/config"
 	"github.com/benhynes/hive/internal/proto"
+	"github.com/benhynes/hive/internal/sshx"
 )
 
 type winOpts struct {
@@ -76,7 +77,7 @@ func winPath(p, what string) (string, error) {
 	return p, nil
 }
 
-func nodeInstallWindows(ssh sshRunner, cfg config.Config, netName string, nc config.NetConfig, o winOpts) error {
+func nodeInstallWindows(ssh sshx.Runner, cfg config.Config, netName string, nc config.NetConfig, o winOpts) error {
 	if o.name == "" {
 		o.name = config.Sanitize(strings.ToLower(o.computer))
 	}
@@ -113,7 +114,7 @@ func nodeInstallWindows(ssh sshRunner, cfg config.Config, netName string, nc con
 	q := func(s string) string { return "'" + s + "'" } // winPath forbids quotes
 
 	// Admin decides firewall + --persist capability.
-	adminOut, _ := ssh.run(nil, winPS(`[bool](New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)`))
+	adminOut, _ := ssh.Run(nil, winPS(`[bool](New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)`))
 	admin := strings.Contains(adminOut, "True")
 
 	// Binary for windows/<arch>.
@@ -127,19 +128,19 @@ func nodeInstallWindows(ssh sshRunner, cfg config.Config, netName string, nc con
 	// Directories, then the binary over scp.
 	destDir := o.dest[:strings.LastIndex(o.dest, `\`)]
 	netDir := o.home + `\nets\` + netName
-	if _, err := ssh.run(nil, winPS(fmt.Sprintf(
+	if _, err := ssh.Run(nil, winPS(fmt.Sprintf(
 		`New-Item -ItemType Directory -Force -Path %s,%s,%s | Out-Null`,
 		q(destDir), q(o.home), q(netDir)))); err != nil {
 		return err
 	}
-	fmt.Printf("installing %s -> %s:%s ...\n", binPath, ssh.target, o.dest)
-	if err := ssh.scp(binPath, o.dest+".tmp"); err != nil {
+	fmt.Printf("installing %s -> %s:%s ...\n", binPath, ssh.Target, o.dest)
+	if err := ssh.SCP(binPath, o.dest+".tmp"); err != nil {
 		return err
 	}
 	if o.restart || o.persist {
-		ssh.run(nil, winPS(`Stop-Process -Name hive -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 300`))
+		ssh.Run(nil, winPS(`Stop-Process -Name hive -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 300`))
 	}
-	if _, err := ssh.run(nil, winPS(fmt.Sprintf(`Move-Item -Force %s %s`, q(o.dest+".tmp"), q(o.dest)))); err != nil {
+	if _, err := ssh.Run(nil, winPS(fmt.Sprintf(`Move-Item -Force %s %s`, q(o.dest+".tmp"), q(o.dest)))); err != nil {
 		return fmt.Errorf("%v (a running daemon locks the binary — pass --restart to upgrade)", err)
 	}
 
@@ -189,14 +190,14 @@ func nodeInstallWindows(ssh sshRunner, cfg config.Config, netName string, nc con
 		if err := os.WriteFile(local, f.data, 0o600); err != nil {
 			return err
 		}
-		if err := ssh.scp(local, f.remote); err != nil {
+		if err := ssh.SCP(local, f.remote); err != nil {
 			return err
 		}
 	}
 
 	// Windows Defender blocks inbound by default; open the daemon port.
 	if admin {
-		if _, err := ssh.run(nil, winPS(fmt.Sprintf(
+		if _, err := ssh.Run(nil, winPS(fmt.Sprintf(
 			`if (-not (Get-NetFirewallRule -DisplayName 'hive' -ErrorAction SilentlyContinue)) { New-NetFirewallRule -DisplayName 'hive' -Direction Inbound -Action Allow -Protocol TCP -LocalPort %d | Out-Null }`,
 			o.port))); err != nil {
 			fmt.Printf("WARNING: firewall rule failed (%v) — inbound %d may be blocked\n", err, o.port)
@@ -209,7 +210,7 @@ func nodeInstallWindows(ssh sshRunner, cfg config.Config, netName string, nc con
 
 	// Start (or persist) the daemon.
 	nodeURL := "http://" + net.JoinHostPort(o.bind, strconv.Itoa(o.port))
-	hint := fmt.Sprintf("ssh %s type %s\\daemon.log", ssh.target, o.home)
+	hint := fmt.Sprintf("ssh %s type %s\\daemon.log", ssh.Target, o.home)
 	if o.persist {
 		if !admin {
 			return fmt.Errorf("--persist on Windows needs an admin ssh user (creates a boot scheduled task)")
@@ -219,12 +220,12 @@ func nodeInstallWindows(ssh sshRunner, cfg config.Config, netName string, nc con
 		create := fmt.Sprintf(
 			`schtasks /Create /F /TN hive /SC ONSTART /RU SYSTEM /TR '"%s" daemon --home "%s"'; if ($LASTEXITCODE -ne 0) { exit 1 }`,
 			o.dest, o.home)
-		if _, err := ssh.run(nil, winPS(create)); err != nil {
+		if _, err := ssh.Run(nil, winPS(create)); err != nil {
 			return fmt.Errorf("schtasks create: %v", err)
 		}
 		fmt.Println("persistence: scheduled task 'hive' (runs at boot as SYSTEM; boot-start only — schtasks does not restart a crashed daemon)")
 		if !o.noStart {
-			if _, err := ssh.run(nil, winPS(`schtasks /Run /TN hive | Out-Null; if ($LASTEXITCODE -ne 0) { exit 1 }`)); err != nil {
+			if _, err := ssh.Run(nil, winPS(`schtasks /Run /TN hive | Out-Null; if ($LASTEXITCODE -ne 0) { exit 1 }`)); err != nil {
 				return fmt.Errorf("schtasks run: %v", err)
 			}
 			if err := waitHealthy(nodeURL, hint); err != nil {
@@ -252,7 +253,7 @@ func nodeInstallWindows(ssh sshRunner, cfg config.Config, netName string, nc con
 			start := fmt.Sprintf(
 				`try { $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=%s} -ErrorAction Stop } catch { Write-Output $_.Exception.Message; exit 1 }; if ($r.ReturnValue -ne 0) { Write-Output ('Win32_Process.Create returned ' + $r.ReturnValue); exit 1 }`,
 				q(cmdLine))
-			if _, err := ssh.run(nil, winPS(start)); err != nil {
+			if _, err := ssh.Run(nil, winPS(start)); err != nil {
 				return err
 			}
 			if err := waitHealthy(nodeURL, hint); err != nil {
@@ -280,7 +281,7 @@ func nodeInstallWindows(ssh sshRunner, cfg config.Config, netName string, nc con
 		// when that ssh session closes (OpenSSH kills the session tree);
 		// launch it detached, or rerun install without --no-start.
 		fmt.Printf("  start it (detached): ssh %s powershell -Command \"Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='cmd /c %s daemon --home %s'}\"\n",
-			ssh.target, o.dest, o.home)
+			ssh.Target, o.dest, o.home)
 	}
 	if !o.persist {
 		fmt.Printf("note: the daemon is not persisted across reboots (rerun with --persist)\n")
@@ -290,14 +291,14 @@ func nodeInstallWindows(ssh sshRunner, cfg config.Config, netName string, nc con
 
 // winTailnetIP finds the node's tailscale IPv4: the CLI if on PATH,
 // else the first interface address in CGNAT 100.64.0.0/10.
-func winTailnetIP(ssh sshRunner) string {
-	if out, err := ssh.run(nil, `tailscale ip -4`); err == nil {
+func winTailnetIP(ssh sshx.Runner) string {
+	if out, err := ssh.Run(nil, `tailscale ip -4`); err == nil {
 		ip := strings.TrimSpace(strings.SplitN(out, "\n", 2)[0])
 		if p := net.ParseIP(ip); p != nil && isCGNAT(p) {
 			return ip
 		}
 	}
-	out, err := ssh.run(nil, winPS(`(Get-NetIPAddress -AddressFamily IPv4).IPAddress`))
+	out, err := ssh.Run(nil, winPS(`(Get-NetIPAddress -AddressFamily IPv4).IPAddress`))
 	if err != nil {
 		return ""
 	}

@@ -95,6 +95,7 @@ func runDaemon(args []string) error {
 	fmt.Printf("hive daemon: host=%s listening on %s:%d\n", cfg.HostName, cfg.Bind, cfg.Port)
 	go h.Reconcile(ctx)
 	go h.SweepNudges(ctx)
+	defer h.Shutdown() // close SSH-host tunnels + transient remote daemons
 	return h.ListenAndServe(ctx)
 }
 
@@ -129,9 +130,14 @@ HOSTS (control layer)
   hive hosts list
   hive hosts add <name> <addr:port>
   hive hosts rm <name>
+  hive hosts add-ssh [--profile P] [--home DIR] [--port N] [--identity KEY] [--bin PATH] <name> <ssh-target>
+                                           register an on-demand SSH host: first
+                                           spawn brings up a transient daemon over
+                                           an SSH tunnel (no install, no firewall)
+  hive hosts rm-ssh <name>                 forget it + tear down its tunnel/daemon
   hive node install [--name N] [--bind IP] [--port N] [--hub A:P] [--persist]
                     [--msg-only|--local-control] [--restart] [--no-start] <ssh-target>
-                                           bootstrap a new host over ssh
+                                           bootstrap a permanent host over ssh
 
 CONTROL (control layer; goes direct to the target host)
   hive spawn [--host H] [--cwd D] [--profile P] [--grant-control] [--wait] [--headed] [--persist] <name> [-- CMD...]

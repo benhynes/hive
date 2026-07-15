@@ -529,9 +529,10 @@ func (h *Hub) hHostsGet(w http.ResponseWriter, r *http.Request, n *network, id i
 
 func (h *Hub) hHostsPost(w http.ResponseWriter, r *http.Request, n *network, id ident) {
 	var req struct {
-		Op   string `json:"op"`
-		Name string `json:"name"`
-		Addr string `json:"addr,omitempty"`
+		Op   string          `json:"op"`
+		Name string          `json:"name"`
+		Addr string          `json:"addr,omitempty"`
+		SSH  *config.SSHHost `json:"ssh,omitempty"`
 	}
 	if !readJSON(w, r, &req) {
 		return
@@ -540,6 +541,45 @@ func (h *Hub) hHostsPost(w http.ResponseWriter, r *http.Request, n *network, id 
 		httpErr(w, 400, "bad host name")
 		return
 	}
+
+	// SSH-host registration is metadata-only and may tear down a live tunnel,
+	// so it runs outside the config lock (bring-up/teardown do their own).
+	switch req.Op {
+	case "add-ssh":
+		if req.SSH == nil || req.SSH.Target == "" {
+			httpErr(w, 400, "add-ssh needs an ssh target")
+			return
+		}
+		n.mu.Lock()
+		if n.cfg.SSHHosts == nil {
+			n.cfg.SSHHosts = map[string]config.SSHHost{}
+		}
+		n.cfg.SSHHosts[req.Name] = *req.SSH
+		err := config.SaveNet(n.cfg)
+		n.mu.Unlock()
+		if err != nil {
+			httpErr(w, 500, "save: %v", err)
+			return
+		}
+		n.auditLine(h.actor(r, id), "hosts-add-ssh", req.Name, req.SSH.Target)
+		writeJSON(w, 200, map[string]any{"self": h.Cfg.HostName, "ssh_host": req.Name})
+		return
+	case "rm-ssh":
+		h.ssh.teardown(n.name, req.Name) // close any live tunnel + remote daemon
+		n.mu.Lock()
+		delete(n.cfg.SSHHosts, req.Name)
+		delete(n.cfg.Hosts, req.Name) // the tunnel's peer entry, if up
+		err := config.SaveNet(n.cfg)
+		n.mu.Unlock()
+		if err != nil {
+			httpErr(w, 500, "save: %v", err)
+			return
+		}
+		n.auditLine(h.actor(r, id), "hosts-rm-ssh", req.Name, "")
+		writeJSON(w, 200, map[string]any{"self": h.Cfg.HostName, "removed": req.Name})
+		return
+	}
+
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	switch req.Op {
@@ -552,7 +592,7 @@ func (h *Hub) hHostsPost(w http.ResponseWriter, r *http.Request, n *network, id 
 	case "rm":
 		delete(n.cfg.Hosts, req.Name)
 	default:
-		httpErr(w, 400, "op must be add or rm")
+		httpErr(w, 400, "op must be add, rm, add-ssh, or rm-ssh")
 		return
 	}
 	if err := config.SaveNet(n.cfg); err != nil {
@@ -599,14 +639,19 @@ func (h *Hub) hRotateControl(w http.ResponseWriter, r *http.Request, n *network,
 }
 
 type spawnReq struct {
-	Name         string   `json:"name"`
-	Cmd          []string `json:"cmd"`
-	Cwd          string   `json:"cwd,omitempty"`
-	Profile      string   `json:"profile,omitempty"` // spawn profile: context + MCP provisioning
-	GrantControl bool     `json:"grant_control,omitempty"`
-	WaitReady    bool     `json:"wait_ready,omitempty"`
-	Headed       bool     `json:"headed,omitempty"`  // open a visible terminal window attached to the session
-	Persist      bool     `json:"persist,omitempty"` // declare it: the daemon respawns it after reboot/crash
+	Name    string   `json:"name"`
+	Cmd     []string `json:"cmd"`
+	Cwd     string   `json:"cwd,omitempty"`
+	Profile string   `json:"profile,omitempty"`  // spawn profile: context + MCP provisioning
+	SSHHost string   `json:"ssh_host,omitempty"` // origin-side: forward this spawn to an SSH host's hub
+	// Provision is a resolved provisioning spec carried on a forwarded spawn
+	// (the remote hub has no access to the origin's profile files). Internal —
+	// clients set Profile, not this.
+	Provision    *provisionSpec `json:"provision,omitempty"`
+	GrantControl bool           `json:"grant_control,omitempty"`
+	WaitReady    bool           `json:"wait_ready,omitempty"`
+	Headed       bool           `json:"headed,omitempty"`  // open a visible terminal window attached to the session
+	Persist      bool           `json:"persist,omitempty"` // declare it: the daemon respawns it after reboot/crash
 }
 
 type spawnResp struct {
@@ -627,10 +672,18 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 		return
 	}
 
-	// Resolve the spawn profile (context + MCP provisioning). Explicit request
-	// fields win over profile fields; a `-- CMD` overrides the profile runtime.
+	// SSH-host target: bring the host up (transient daemon + tunnels) and
+	// forward a normal spawn to its hub. Handled entirely here; returns.
+	if req.SSHHost != "" {
+		h.spawnOntoSSH(w, r, n, id, req)
+		return
+	}
+
+	// Resolve the spawn profile (context + MCP provisioning). A forwarded spawn
+	// already carries a resolved spec (req.Provision) and skips profile lookup,
+	// since the profile files live on the origin, not here.
 	var prof config.SpawnProfile
-	if req.Profile != "" {
+	if req.Provision == nil && req.Profile != "" {
 		var err error
 		if prof, err = config.LoadProfile(req.Profile); err != nil {
 			httpErr(w, 400, "profile %q: %v", req.Profile, err)
@@ -653,7 +706,17 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 	// the runtime starts. Only when there is a cwd to write into — without one
 	// there is no project dir to seed, so a bare `spawn -- claude` is unchanged.
 	if req.Cwd != "" {
-		if err := provisionAgent(req.Cwd, prof, hiveBinPath()); err != nil {
+		spec := provisionSpec{}
+		if req.Provision != nil {
+			spec = *req.Provision
+		} else {
+			var err error
+			if spec, err = buildProvision(prof); err != nil {
+				httpErr(w, 500, "provision: %v", err)
+				return
+			}
+		}
+		if err := applyProvision(req.Cwd, spec, hiveBinPath()); err != nil {
 			httpErr(w, 500, "provision: %v", err)
 			return
 		}

@@ -513,6 +513,12 @@ type SpawnResp struct {
 
 func (c *Client) Spawn(host, name string, cmd []string, cwd, profile string, grantControl, waitReady, headed, persist bool) (SpawnResp, error) {
 	var err error
+	// An SSH host isn't a daemon peer: the local hub owns its bring-up, so route
+	// the spawn to the local hub with ssh_host set and let it forward.
+	sshHost := ""
+	if host != "" && c.isSSHHost(host) {
+		sshHost, host = host, ""
+	}
 	if host == "" {
 		if host, err = c.Self(); err != nil {
 			return SpawnResp{}, err
@@ -528,11 +534,42 @@ func (c *Client) Spawn(host, name string, cmd []string, cwd, profile string, gra
 	}
 	var out SpawnResp
 	err = c.do("POST", base, c.np("/spawn"), tok, map[string]any{
-		"name": name, "cmd": cmd, "cwd": cwd, "profile": profile,
+		"name": name, "cmd": cmd, "cwd": cwd, "profile": profile, "ssh_host": sshHost,
 		"grant_control": grantControl, "wait_ready": waitReady, "headed": headed,
 		"persist": persist,
 	}, &out)
 	return out, err
+}
+
+// isSSHHost reports whether name is a locally-registered SSH host (metadata in
+// this hub's net.json). Best-effort: config unreadable → not an SSH host.
+func (c *Client) isSSHHost(name string) bool {
+	nc, err := config.LoadNet(c.Net)
+	if err != nil {
+		return false
+	}
+	_, ok := nc.SSHHosts[name]
+	return ok
+}
+
+// AddSSHHost registers an SSH host with the local hub. RemoveSSHHost tears one
+// down and forgets it.
+func (c *Client) AddSSHHost(name string, sh config.SSHHost) error {
+	tok, err := c.localControlToken()
+	if err != nil {
+		return err
+	}
+	return c.do("POST", c.Addr, c.np("/hosts"), tok,
+		map[string]any{"op": "add-ssh", "name": name, "ssh": sh}, nil)
+}
+
+func (c *Client) RemoveSSHHost(name string) error {
+	tok, err := c.localControlToken()
+	if err != nil {
+		return err
+	}
+	return c.do("POST", c.Addr, c.np("/hosts"), tok,
+		map[string]any{"op": "rm-ssh", "name": name}, nil)
 }
 
 // controlTarget resolves an agent id to (hubBase, fullID).

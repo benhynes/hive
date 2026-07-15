@@ -197,6 +197,32 @@ Rotation requires the local daemon so it can update in-memory auth and
 `net.json` together. It does not update peers: each peer still accepting
 the old shared token must be rotated or reprovisioned separately.
 
+## Add an SSH host (on-demand, no install)
+
+`node install` is the heavyweight path: a permanent daemon, a firewall port, a
+supervisor. When you just want to *spawn an agent onto a box you can SSH to*,
+register it as an SSH host instead — nothing is installed until the first spawn:
+
+```sh
+hive hosts add-ssh --profile dev edge me@some-box     # metadata only
+hive spawn --host edge worker                          # brings it up + spawns
+```
+
+On that first spawn the local hub, over one SSH ControlMaster connection, ships
+a hive binary to the target, starts a **transient** daemon bound to the target's
+loopback (no firewall, no supervisor), and wires two loopback port-forwards
+(`-L`/`-R`) that carry hub↔hub traffic. The remote is then a normal mesh peer
+reached through a loopback address, so messaging, discovery, and the spawn
+itself reuse the existing paths unchanged — the agent is provisioned (context +
+MCP, §"Spawn profiles") by the same machinery as a local spawn. `hive hosts
+rm-ssh edge` tears the tunnel and transient daemon down and forgets the host.
+
+The remote gets a **host-local** control token (never the network-wide one), and
+both tunnels bind loopback only — nothing is exposed on either host's network.
+This is also the clean replacement for a hand-rolled `ssh -L` tunnel to a VM
+hub: loopback forwards sidestep macOS Local-Network TCC. See
+[docs/ssh-hosts-design.md](docs/ssh-hosts-design.md).
+
 ## Security model
 
 - **Two layers.** Control endpoints require the receiving hub's control
