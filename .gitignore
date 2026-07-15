@@ -1,3 +1,7 @@
 .DS_Store
-/hive
 /.worktrees/
+
+# built binaries
+/hive
+hive.exe
+*.exe
