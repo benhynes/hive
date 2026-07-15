@@ -142,6 +142,15 @@ Stored per-net (see §5). `--profile` names a spawn profile (§4).
    tunnel. The remote daemon mints the agent token, injects `HIVE_*` via tmux
    `-e`, and (per the profile) the agent's `hive mcp` is already registered.
 
+**Latency: run provisioning (6) concurrently with daemon + tunnel bring-up
+(4–5).** They share only the ControlMaster connection (already multiplexed), not
+each other's results, and provisioning's worst case — a `git clone` of a large
+repo — can dwarf daemon startup. Overlapping them hides the clone behind the
+bring-up instead of adding to it; the spawn (7) is the join point that waits on
+both. This is the main first-spawn latency lever; warm lifecycle (§3 teardown)
+removes it entirely for subsequent spawns, and control ops afterward are one
+network RTT over the warm tunnel (human/agent-paced, not worth pre-optimizing).
+
 ### Teardown
 
 The origin hub owns lifecycle. Options (flag / profile setting):
