@@ -217,9 +217,14 @@ func (m *sshManager) joinRemote(runner sshx.Runner, n *network, host, homeRP str
 	nc := n.cfg
 	n.mu.Unlock()
 
-	// -R: remote 127.0.0.1:<rp> reaches this hub's real port.
-	rp, err := runner.ForwardR(0, m.h.Cfg.Port)
+	// -R: a remote loopback port reaches this hub's real port. Pick a specific
+	// free port on the remote first — OpenSSH's `-O forward` (mux) can't do
+	// dynamic (port 0) allocation, so we can't ask sshd to choose.
+	rp, err := freeRemotePort(runner)
 	if err != nil {
+		return "", err
+	}
+	if _, err := runner.ForwardR(rp, m.h.Cfg.Port); err != nil {
 		return "", fmt.Errorf("forward -R: %w", err)
 	}
 
@@ -411,6 +416,23 @@ func postJSON(base, path, token string, in, out any, timeout time.Duration) erro
 		return json.NewDecoder(resp.Body).Decode(out)
 	}
 	return nil
+}
+
+// freeRemotePort probes an unused 127.0.0.1 port on the remote (for the -R
+// forward, whose listen port lives there). Uses python3, which every supported
+// SSH host has; a tiny TOCTOU window is acceptable (bring-up would just error
+// and retry). Works for the loopback shim too (runs locally there).
+func freeRemotePort(runner sshx.Runner) (int, error) {
+	out, err := runner.Run(nil,
+		`python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'`)
+	if err != nil {
+		return 0, fmt.Errorf("probe remote free port (needs python3 on the host): %w", err)
+	}
+	p, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil || p == 0 {
+		return 0, fmt.Errorf("bad remote free port %q", strings.TrimSpace(out))
+	}
+	return p, nil
 }
 
 // freeLoopbackPort asks the OS for an unused 127.0.0.1 port, avoiding a fixed

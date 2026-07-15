@@ -51,12 +51,10 @@ if [ "$octl" = "forward" ]; then
     exit 0
   fi
   if [ -n "$fwdR" ]; then
-    # 127.0.0.1:0:127.0.0.1:OP -> allocate a port, proxy it to OP, print it
-    op="$(echo "$fwdR" | cut -d: -f4)"
-    ap="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
-    socat "TCP-LISTEN:$ap,bind=127.0.0.1,reuseaddr,fork" "TCP:127.0.0.1:$op" >/dev/null 2>&1 &
+    # 127.0.0.1:RP:127.0.0.1:OP -> proxy the specific remote port RP to OP.
+    rp="$(echo "$fwdR" | cut -d: -f2)"; op="$(echo "$fwdR" | cut -d: -f4)"
+    socat "TCP-LISTEN:$rp,bind=127.0.0.1,reuseaddr,fork" "TCP:127.0.0.1:$op" >/dev/null 2>&1 &
     echo $! >> "$dir/socat.pids"
-    echo "Allocated port $ap for remote forward"
     exit 0
   fi
   exit 0

@@ -355,10 +355,15 @@ All five are settled; integration follows these.
   socat standing in for real `ssh -L`/`-R` on loopback: register → first-spawn
   bring-up → forward-spawn → cross-hub delivery to the SSH-hosted agent, all
   through the tunnel. Deferred to P3: warm/idle timeout + reconnect, and
-  control-op (read/keys/kill) transparency from a third-party client. Not yet
-  run against a real second machine (the design's "OrbStack/tart VM" check) —
-  the shim proves the orchestration; real-SSH transport is what `sshx`/`node
-  install` already ship.
+  control-op (read/keys/kill) transparency from a third-party client.
+  **Real-VM verified (2026-07-14):** origin macOS/arm64 → hetzner1 Linux/x86_64
+  over real SSH — bring-up, cross-arch binary ship, transient daemon, `-L`/`-R`
+  forwards, forward-spawn, and cross-hub delivery **both directions**
+  (origin→edge and edge→origin) all worked, then torn down clean. Two fixes the
+  real run forced: OpenSSH's `-O forward` (mux) can't do dynamic (port-0) `-R`
+  allocation, so we probe a specific free remote port first (`freeRemotePort`).
+  Caveat: OrbStack VMs' sshd forbids remote (`-R`) forwarding entirely — use a
+  host with a standard sshd.
 - **P3 — lifecycle + control transparency:** warm/idle teardown, health-poll +
   reconnect (the hard part — rebuild ControlMaster + restart remote daemon,
   re-adopting persisted agents), audit; confirm read/keys/kill route through the

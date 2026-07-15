@@ -121,8 +121,18 @@ func (s Runner) ForwardL(localPort, remotePort int) error {
 // ForwardR adds a remote→local reverse forward (-R) on the live master,
 // letting the remote reach 127.0.0.1:localPort here. Passing remotePort 0
 // asks the remote sshd to allocate one; the allocated port is returned.
+//
+// Dynamic allocation uses the `0:host:port` form (no bind address) — OpenSSH's
+// `-O forward` rejects the `127.0.0.1:0:...` form with "listen port 0". With
+// GatewayPorts at its default (no), the allocated port still binds loopback on
+// the remote.
 func (s Runner) ForwardR(remotePort, localPort int) (int, error) {
-	spec := fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%d", remotePort, localPort)
+	var spec string
+	if remotePort == 0 {
+		spec = fmt.Sprintf("0:127.0.0.1:%d", localPort)
+	} else {
+		spec = fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%d", remotePort, localPort)
+	}
 	out, err := s.ctl("-O", "forward", "-R", spec)
 	if err != nil {
 		return 0, err
