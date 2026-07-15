@@ -358,11 +358,18 @@ func (h *Hub) SweepNudges(ctx context.Context) {
 		h.mu.Unlock()
 		for _, n := range nets {
 			for _, rec := range n.reg.List() {
-				if rec.Pane == "" || !alive(rec) {
+				if rec.Pane == "" {
 					continue
 				}
 				ib, err := n.inbox(rec.Name)
 				if err != nil {
+					continue
+				}
+				// Check for unread mail (in-memory) before liveness: alive()
+				// shells out to tmux + ps, and most agents have nothing pending,
+				// so gating the subprocess spawns on Lag keeps the sweep from
+				// costing 2 execs per agent per tick across the whole roster.
+				if ib.Lag() <= 0 || !alive(rec) {
 					continue
 				}
 				h.nudge(n, rec, ib)
