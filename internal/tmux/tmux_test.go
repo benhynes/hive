@@ -141,6 +141,27 @@ func TestStartCapture(t *testing.T) {
 	t.Fatalf("capture did not contain marker: %q", b)
 }
 
+func TestNewSessionCapturesFromStartup(t *testing.T) {
+	setup(t)
+	path := filepath.Join(t.TempDir(), "startup.log")
+	if err := os.WriteFile(path, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := NewSession("startup-capture", "", nil, []string{"sh", "-c", "printf first-byte; sleep 1"}, path); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		b, _ := os.ReadFile(path)
+		if strings.Contains(string(b), "first-byte") {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	b, _ := os.ReadFile(path)
+	t.Fatalf("startup capture missed output: %q", b)
+}
+
 func TestPaneLifecycle(t *testing.T) {
 	setup(t)
 	pane, spawnPID, err := NewSession("life", "", nil, []string{"sleep", "60"})

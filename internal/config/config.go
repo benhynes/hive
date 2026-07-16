@@ -103,11 +103,12 @@ type SpawnProfile struct {
 }
 
 type RuntimeSetup struct {
-	Type        string `json:"type"`                   // codex or claude
-	AuthSource  string `json:"auth_source"`            // trusted host credential file copied 0600
-	StateSource string `json:"state_source,omitempty"` // Claude state file copied and pre-approved
-	Workspace   string `json:"workspace,omitempty"`    // runtime-visible cwd; defaults to /workspace when sandboxed
-	HiveCommand string `json:"hive_command,omitempty"` // runtime-visible hive binary; defaults to /usr/local/bin/hive in a sandbox
+	Type            string `json:"type"`                        // codex or claude
+	AuthSource      string `json:"auth_source"`                 // trusted host credential file copied 0600
+	StateSource     string `json:"state_source,omitempty"`      // Claude state file copied and pre-approved
+	Workspace       string `json:"workspace,omitempty"`         // runtime-visible cwd; defaults to /workspace when sandboxed
+	HiveCommand     string `json:"hive_command,omitempty"`      // runtime-visible hive binary; defaults to /usr/local/bin/hive in a sandbox
+	CheckForUpdates *bool  `json:"check_for_updates,omitempty"` // Codex startup update check; nil preserves its default
 }
 
 type SandboxRunner struct {

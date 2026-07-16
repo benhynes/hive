@@ -388,12 +388,27 @@ type AgentInfo struct {
 	Agent        string `json:"agent"`
 	Alive        bool   `json:"alive"`
 	Controllable bool   `json:"controllable"`
+	Transcript   string `json:"transcript,omitempty"`
 	Nudgeable    bool   `json:"nudgeable"`
 	Ephemeral    bool   `json:"ephemeral,omitempty"`
 	Spawned      bool   `json:"spawned,omitempty"`
 	Registered   int64  `json:"registered"`
 	LastSeen     int64  `json:"last_seen,omitempty"`
 	LeaseExpires int64  `json:"lease_expires,omitempty"`
+}
+
+type SpawnOptions struct {
+	Host         string
+	Name         string
+	Cmd          []string
+	Cwd          string
+	Profile      string
+	GrantControl bool
+	WaitReady    bool
+	Headed       bool
+	Nudge        bool
+	Persist      bool
+	Replace      bool
 }
 
 type AgentsResp struct {
@@ -745,9 +760,18 @@ func (c *Client) Spawn(host, name string, cmd []string, cwd, profile string, gra
 // SpawnWithNudge is Spawn with explicit consent for the hub to submit fixed
 // terminal wake notices when mail arrives and the child is idle.
 func (c *Client) SpawnWithNudge(host, name string, cmd []string, cwd, profile string, grantControl, waitReady, headed, nudge, persist bool) (SpawnResp, error) {
+	return c.SpawnWithOptions(SpawnOptions{
+		Host: host, Name: name, Cmd: cmd, Cwd: cwd, Profile: profile,
+		GrantControl: grantControl, WaitReady: waitReady, Headed: headed,
+		Nudge: nudge, Persist: persist,
+	})
+}
+
+func (c *Client) SpawnWithOptions(opts SpawnOptions) (SpawnResp, error) {
 	var err error
 	// An SSH host isn't a daemon peer: the local hub owns its bring-up, so route
 	// the spawn to the local hub with ssh_host set and let it forward.
+	host := opts.Host
 	sshHost := ""
 	if host != "" && c.isSSHHost(host) {
 		sshHost, host = host, ""
@@ -770,11 +794,11 @@ func (c *Client) SpawnWithNudge(host, name string, cmd []string, cwd, profile st
 	}
 	var out SpawnResp
 	err = c.do("POST", base, c.np("/spawn/v2"), tok, map[string]any{
-		"name": name, "cmd": cmd, "cwd": cwd, "profile": profile, "ssh_host": sshHost,
-		"grant_control": grantControl, "wait_ready": waitReady, "headed": headed,
-		"nudge": nudge, "persist": persist,
+		"name": opts.Name, "cmd": opts.Cmd, "cwd": opts.Cwd, "profile": opts.Profile, "ssh_host": sshHost,
+		"grant_control": opts.GrantControl, "wait_ready": opts.WaitReady, "headed": opts.Headed,
+		"nudge": opts.Nudge, "persist": opts.Persist, "replace": opts.Replace,
 	}, &out)
-	if err == nil && (out.NudgePolicy != "explicit" || out.Nudge != nudge) {
+	if err == nil && (out.NudgePolicy != "explicit" || out.Nudge != opts.Nudge) {
 		return SpawnResp{}, fmt.Errorf("daemon advertised explicit terminal nudging but did not honor the requested policy")
 	}
 	return out, err

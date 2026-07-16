@@ -32,8 +32,9 @@ func TestProvisionCodexRuntimeIntoWorkspace(t *testing.T) {
 	if err := os.WriteFile(auth, []byte(`{"auth_mode":"chatgpt"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	checkUpdates := false
 	prof := config.SpawnProfile{
-		RuntimeSetup: &config.RuntimeSetup{Type: "codex", AuthSource: auth},
+		RuntimeSetup: &config.RuntimeSetup{Type: "codex", AuthSource: auth, CheckForUpdates: &checkUpdates},
 		Sandbox:      &config.SandboxRunner{Command: "/usr/local/bin/ff", Profiles: "/etc/runner.yaml", Profile: "codex"},
 	}
 	if err := provisionAgent(cwd, prof, "/host/hive"); err != nil {
@@ -50,6 +51,7 @@ func TestProvisionCodexRuntimeIntoWorkspace(t *testing.T) {
 		!strings.Contains(string(configText), `command = "/usr/local/bin/hive"`) ||
 		!strings.Contains(string(configText), `"/workspace/.hive-mcp.log"`) ||
 		!strings.Contains(string(configText), `"HIVE_AGENT"`) ||
+		!strings.Contains(string(configText), `check_for_update_on_startup = false`) ||
 		!strings.Contains(string(configText), `[projects."/workspace"]`) {
 		t.Fatalf("codex config = %s", configText)
 	}

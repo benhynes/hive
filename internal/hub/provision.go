@@ -24,11 +24,12 @@ type provisionSpec struct {
 }
 
 type runtimeProvision struct {
-	Type        string `json:"type"`
-	Auth        []byte `json:"auth,omitempty"`
-	State       []byte `json:"state,omitempty"`
-	Workspace   string `json:"workspace"`
-	HiveCommand string `json:"hive_command"`
+	Type            string `json:"type"`
+	Auth            []byte `json:"auth,omitempty"`
+	State           []byte `json:"state,omitempty"`
+	Workspace       string `json:"workspace"`
+	HiveCommand     string `json:"hive_command"`
+	CheckForUpdates *bool  `json:"check_for_updates,omitempty"`
 }
 
 // buildProvision resolves a profile into a self-contained spec, reading the
@@ -136,6 +137,7 @@ func buildRuntimeProvision(setup config.RuntimeSetup, sandboxed bool) (*runtimeP
 	}
 	return &runtimeProvision{
 		Type: setup.Type, Auth: auth, State: state, Workspace: workspace, HiveCommand: hiveCommand,
+		CheckForUpdates: setup.CheckForUpdates,
 	}, nil
 }
 
@@ -160,6 +162,9 @@ func provisionCodex(cwd string, runtime *runtimeProvision, servers map[string]co
 	}
 	var configText strings.Builder
 	configText.WriteString("cli_auth_credentials_store = \"file\"\n")
+	if runtime.CheckForUpdates != nil {
+		fmt.Fprintf(&configText, "check_for_update_on_startup = %v\n", *runtime.CheckForUpdates)
+	}
 	if runtime.Workspace != "" {
 		fmt.Fprintf(&configText, "\n[projects.%q]\ntrust_level = \"trusted\"\n", runtime.Workspace)
 	}

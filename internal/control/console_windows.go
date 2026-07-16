@@ -190,7 +190,7 @@ func openVerified(pid uint32, creation uint64, hasEpoch bool, access uint32) (sy
 // meaningful when the daemon runs in the interactive user session);
 // headless spawns use CREATE_NO_WINDOW — same conhost, no window, still
 // controllable.
-func NewSession(session, cwd string, env map[string]string, cmd []string, headed bool) (string, int, error) {
+func NewSession(session, cwd string, env map[string]string, cmd []string, headed bool, _ ...string) (string, int, error) {
 	if len(cmd) == 0 {
 		return "", 0, fmt.Errorf("empty command")
 	}
@@ -265,6 +265,8 @@ func NewSession(session, cwd string, env map[string]string, cmd []string, headed
 	}
 	return winPane(pi.ProcessId, creation), int(pi.ProcessId), nil
 }
+
+func SupportsTranscript() bool { return false }
 
 // envBlock merges extra into the daemon's environment (Windows env names
 // are case-insensitive; extra wins) and encodes the sorted UTF-16

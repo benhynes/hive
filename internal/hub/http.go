@@ -389,6 +389,7 @@ type agentInfo struct {
 	Agent        string `json:"agent"`
 	Alive        bool   `json:"alive"`
 	Controllable bool   `json:"controllable"`
+	Transcript   string `json:"transcript,omitempty"`
 	Nudgeable    bool   `json:"nudgeable"`
 	Ephemeral    bool   `json:"ephemeral,omitempty"`
 	Spawned      bool   `json:"spawned,omitempty"`
@@ -414,6 +415,7 @@ func (h *Hub) localAgents(n *network) []agentInfo {
 			Agent:        rec.Name + "@" + h.Cfg.HostName,
 			Alive:        aliveAt(rec, now),
 			Controllable: rec.Pane != "",
+			Transcript:   rec.Transcript,
 			Nudgeable:    rec.Pane != "" && rec.Nudge,
 			Ephemeral:    rec.Ephemeral,
 			Spawned:      rec.Spawned,
@@ -855,6 +857,7 @@ type spawnReq struct {
 	WaitReady    bool           `json:"wait_ready,omitempty"`
 	Headed       bool           `json:"headed,omitempty"`  // open a visible terminal window attached to the session
 	Persist      bool           `json:"persist,omitempty"` // declare it: the daemon respawns it after reboot/crash
+	Replace      bool           `json:"replace,omitempty"` // atomically replace an existing registration/session
 }
 
 type spawnResp struct {
@@ -947,7 +950,13 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 		return
 	}
 
-	rec, serr := h.spawnCore(n, h.actor(r, id), req, session, tok, env)
+	var rec store.AgentRec
+	var serr *spawnErr
+	if req.Replace {
+		rec, serr = h.spawnReplacing(n, h.actor(r, id), req, session, tok, env)
+	} else {
+		rec, serr = h.spawnCore(n, h.actor(r, id), req, session, tok, env)
+	}
 	if serr != nil {
 		// A persist-spawn of an agent that is already alive is a declaration
 		// update, not a conflict — that makes `spawn --persist` idempotent
@@ -1152,10 +1161,55 @@ func (h *Hub) spawnCore(n *network, actor string,
 	req spawnReq, session, tok string, env map[string]string) (store.AgentRec, *spawnErr) {
 	n.regMu.Lock()
 	defer n.regMu.Unlock()
+	return h.spawnCoreLocked(n, actor, req, session, tok, env)
+}
+
+// spawnReplacing keeps the name claim locked while the old session is
+// detached and the new one is created, so another register/spawn cannot take
+// the name in between.
+func (h *Hub) spawnReplacing(n *network, actor string,
+	req spawnReq, session, tok string, env map[string]string) (store.AgentRec, *spawnErr) {
+	n.regMu.Lock()
+	defer n.regMu.Unlock()
+	if old, ok := n.reg.Get(req.Name); ok {
+		if old.Ephemeral {
+			if err := n.retireInbox(req.Name); err != nil {
+				return store.AgentRec{}, &spawnErr{500, fmt.Sprintf("retire expired mailbox: %v", err)}
+			}
+		}
+		if err := n.reg.Delete(req.Name); err != nil {
+			return store.AgentRec{}, &spawnErr{500, fmt.Sprintf("registry: %v", err)}
+		}
+		if old.Session != "" {
+			if err := control.KillSession(old.Session, old.Pane); err != nil && alive(old) {
+				return store.AgentRec{}, &spawnErr{500, fmt.Sprintf("replace old session: %v", err)}
+			}
+		}
+	}
+	if _, ok := n.persist.Get(req.Name); ok {
+		if err := n.persist.Delete(req.Name); err != nil {
+			return store.AgentRec{}, &spawnErr{500, fmt.Sprintf("replace declaration: %v", err)}
+		}
+	}
+	n.auditLine(actor, "replace", req.Name+"@"+h.Cfg.HostName, "old registration/session removed")
+	return h.spawnCoreLocked(n, actor, req, session, tok, env)
+}
+
+// spawnCoreLocked creates a session and record while n.regMu is held.
+func (h *Hub) spawnCoreLocked(n *network, actor string,
+	req spawnReq, session, tok string, env map[string]string) (store.AgentRec, *spawnErr) {
 	if old, ok := n.reg.Get(req.Name); ok && alive(old) {
 		return store.AgentRec{}, &spawnErr{409, fmt.Sprintf("name %q is taken by a live agent", req.Name)}
 	}
-	pane, pid, err := control.NewSession(session, req.Cwd, env, req.Cmd, req.Headed)
+	transcript := ""
+	if control.SupportsTranscript() {
+		var transcriptErr error
+		transcript, transcriptErr = prepareTranscript(n.name, req.Name)
+		if transcriptErr != nil {
+			n.auditLine(actor, "transcript", req.Name+"@"+h.Cfg.HostName, "disabled: "+transcriptErr.Error())
+		}
+	}
+	pane, pid, err := control.NewSession(session, req.Cwd, env, req.Cmd, req.Headed, transcript)
 	if errors.Is(err, control.ErrDuplicateSession) {
 		// Reclaim only a session this network's registry owns (a dead
 		// registration or crash leftover). tmux's session namespace is
@@ -1164,13 +1218,16 @@ func (h *Hub) spawnCore(n *network, actor string,
 		// have no shared namespace and never collide.)
 		if old, ok := n.reg.Get(req.Name); ok && old.Session == session {
 			control.KillSession(session, old.Pane)
-			pane, pid, err = control.NewSession(session, req.Cwd, env, req.Cmd, req.Headed)
+			pane, pid, err = control.NewSession(session, req.Cwd, env, req.Cmd, req.Headed, transcript)
 		} else {
 			return store.AgentRec{}, &spawnErr{409,
 				fmt.Sprintf("tmux session %q exists but is not owned by network %q — kill it manually", session, n.name)}
 		}
 	}
 	if err != nil {
+		if transcript != "" {
+			os.Remove(transcript)
+		}
 		return store.AgentRec{}, &spawnErr{500, fmt.Sprintf("spawn: %v", err)}
 	}
 	epoch, err := control.ProcStartEpoch(pid)
@@ -1187,12 +1244,7 @@ func (h *Hub) spawnCore(n *network, actor string,
 	rec := store.AgentRec{
 		Name: req.Name, TokenHash: proto.HashToken(tok),
 		Pane: pane, Session: session, PID: pid, StartEpoch: epoch,
-		Spawned: true, Nudge: req.Nudge, Registered: time.Now().UnixMilli(),
-	}
-	if transcript, err := startTranscript(n.name, req.Name, pane); err == nil {
-		rec.Transcript = transcript
-	} else {
-		n.auditLine(actor, "transcript", rec.Name+"@"+h.Cfg.HostName, "disabled: "+err.Error())
+		Spawned: true, Nudge: req.Nudge, Registered: time.Now().UnixMilli(), Transcript: transcript,
 	}
 	if err := n.reg.Put(rec); err != nil {
 		control.KillSession(session, pane)
@@ -1203,7 +1255,7 @@ func (h *Hub) spawnCore(n *network, actor string,
 	return rec, nil
 }
 
-func startTranscript(network, agent, pane string) (string, error) {
+func prepareTranscript(network, agent string) (string, error) {
 	dir := filepath.Join(config.Home(), "runs", network)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", err
@@ -1214,10 +1266,6 @@ func startTranscript(network, agent, pane string) (string, error) {
 		return "", err
 	}
 	if err := f.Close(); err != nil {
-		return "", err
-	}
-	if err := control.StartCapture(pane, path); err != nil {
-		os.Remove(path)
 		return "", err
 	}
 	return path, nil
