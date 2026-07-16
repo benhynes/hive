@@ -17,9 +17,10 @@ type AgentRec struct {
 	Name       string `json:"name"`
 	Layer      string `json:"layer"` // "msg" | "control"
 	TokenHash  string `json:"token_hash"`
-	Pane       string `json:"pane,omitempty"`    // tmux pane id (%N); empty = not controllable
-	Nudge      bool   `json:"nudge,omitempty"`   // explicitly allow fixed terminal wake notices
-	Session    string `json:"session,omitempty"` // tmux session, set for spawned agents
+	Pane       string `json:"pane,omitempty"`       // tmux pane id (%N); empty = not controllable
+	Nudge      bool   `json:"nudge,omitempty"`      // explicitly allow fixed terminal wake notices
+	Session    string `json:"session,omitempty"`    // tmux session, set for spawned agents
+	Transcript string `json:"transcript,omitempty"` // retained terminal output for spawned agents
 	PID        int    `json:"pid,omitempty"`
 	StartEpoch string `json:"start_epoch,omitempty"` // `ps -o lstart=` string; guards pid reuse
 	Spawned    bool   `json:"spawned,omitempty"`

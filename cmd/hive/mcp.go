@@ -37,10 +37,24 @@ func runMCP(args []string) error {
 	fs := flags("mcp", args)
 	list := fs.Bool("list", false, "print the tools this agent would be offered, then exit")
 	name := fs.String("name", "", "agent name for automatic registration (default: generated)")
+	logFile := fs.String("log-file", "", "append diagnostics to this file (stderr remains the protocol-safe default)")
 	fs.Parse2()
+	var diagnostic io.Writer = os.Stderr
+	var log *os.File
+	if *logFile != "" {
+		var err error
+		log, err = os.OpenFile(*logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			return fmt.Errorf("open MCP log: %w", err)
+		}
+		defer log.Close()
+		diagnostic = io.MultiWriter(os.Stderr, log)
+		fmt.Fprintf(log, "hive mcp: starting at %s\n", time.Now().UTC().Format(time.RFC3339Nano))
+	}
 
 	c, err := resolveMCPClient(*fs.net)
 	if err != nil {
+		fmt.Fprintf(diagnostic, "hive mcp: resolve client: %v\n", err)
 		return err
 	}
 
@@ -108,6 +122,11 @@ func runMCP(args []string) error {
 
 	srv := mcp.NewServer("hive", mcpServerVersion, tools)
 	err = srv.ServeStdio(ctx, cancelOnEOFReader{Reader: os.Stdin, cancel: cancel}, os.Stdout)
+	if err != nil {
+		fmt.Fprintf(diagnostic, "hive mcp: protocol exit: %v\n", err)
+	} else {
+		fmt.Fprintln(diagnostic, "hive mcp: protocol EOF")
+	}
 	cancel()
 	leaseWG.Wait()
 	if needsEnrollment && gate.enrolledIdentity() {

@@ -732,6 +732,9 @@ type SpawnResp struct {
 	Nudge       bool   `json:"nudge,omitempty"`
 	NudgePolicy string `json:"nudge_policy"`
 	Ready       bool   `json:"ready"`
+	State       string `json:"state,omitempty"`
+	Detail      string `json:"detail,omitempty"`
+	Transcript  string `json:"transcript,omitempty"`
 	Window      string `json:"window,omitempty"`
 }
 

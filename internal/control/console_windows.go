@@ -431,6 +431,11 @@ func Capture(pane string, lines int) (string, error) {
 	return conOp(pane, "capture", strconv.Itoa(lines))
 }
 
+// StartCapture is not yet available for the Windows console backend.
+func StartCapture(_, _ string) error {
+	return fmt.Errorf("terminal transcripts are not supported on Windows")
+}
+
 // OpenWindow makes the session's console window visible — only possible
 // for sessions spawned with headed=true (CREATE_NO_WINDOW consoles have
 // no window at all, revealable or otherwise).

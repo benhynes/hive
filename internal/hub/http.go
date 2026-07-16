@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -863,6 +864,9 @@ type spawnResp struct {
 	Nudge       bool   `json:"nudge,omitempty"`
 	NudgePolicy string `json:"nudge_policy"`
 	Ready       bool   `json:"ready"`
+	State       string `json:"state,omitempty"`
+	Detail      string `json:"detail,omitempty"`
+	Transcript  string `json:"transcript,omitempty"`
 	Window      string `json:"window,omitempty"` // headed result: "opened" or the error
 }
 
@@ -966,7 +970,7 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 				n.auditLine(h.actor(r, id), "spawn", req.Name+"@"+h.Cfg.HostName, "already live; declaration updated")
 				writeJSON(w, 200, spawnResp{
 					Agent: old.Name + "@" + h.Cfg.HostName, Session: old.Session, Pane: old.Pane,
-					Nudge: old.Nudge, NudgePolicy: "explicit", Ready: true,
+					Nudge: old.Nudge, NudgePolicy: "explicit", Ready: true, Transcript: old.Transcript,
 				})
 				return
 			}
@@ -994,17 +998,80 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 		}
 	}
 	ready := false
+	state := "started"
+	detail := ""
 	if req.WaitReady {
 		// No pre-sleep: WaitQuiescent's first capture/window/compare cycle
 		// already tolerates a not-yet-drawn frame (a still-drawing pane is
 		// simply non-quiescent and gets re-polled), so a fixed 500ms up
 		// front was pure dead time on every wait-ready spawn.
 		ready = control.WaitQuiescent(rec.Pane, 700*time.Millisecond, 15*time.Second)
+		state, detail = waitSemanticReadiness(rec.Pane, ready, 4*time.Second)
+		ready = state == "ready"
 	}
 	writeJSON(w, 200, spawnResp{
 		Agent: rec.Name + "@" + h.Cfg.HostName, Session: rec.Session, Pane: rec.Pane,
-		Nudge: rec.Nudge, NudgePolicy: "explicit", Ready: ready, Window: window,
+		Nudge: rec.Nudge, NudgePolicy: "explicit", Ready: ready, State: state, Detail: detail,
+		Transcript: rec.Transcript, Window: window,
 	})
+}
+
+func waitSemanticReadiness(pane string, quiescent bool, timeout time.Duration) (string, string) {
+	if !quiescent {
+		return classifySpawnReadiness(pane, false)
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		state, detail := classifySpawnReadiness(pane, true)
+		if state != "starting" || time.Now().After(deadline) {
+			return state, detail
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func classifySpawnReadiness(pane string, quiescent bool) (string, string) {
+	if !control.PaneExists(pane) {
+		return "exited", "pane_closed"
+	}
+	if !quiescent {
+		return "starting", "terminal_not_quiescent"
+	}
+	screen, err := control.Capture(pane, 80)
+	if err != nil {
+		return "starting", "capture_failed"
+	}
+	if strings.TrimSpace(screen) == "" {
+		return "starting", "terminal_empty"
+	}
+	if detail := classifyRuntimePrompt(screen); detail != "" {
+		return "blocked_on_runtime_prompt", detail
+	}
+	return "ready", ""
+}
+
+func classifyRuntimePrompt(screen string) string {
+	lower := strings.ToLower(screen)
+	blockers := []struct {
+		needle string
+		detail string
+	}{
+		{"update available!", "runtime_update_prompt"},
+		{"do you trust the contents of this directory", "workspace_trust_prompt"},
+		{"is this a project you created or one you trust", "workspace_trust_prompt"},
+		{"choose the text style that looks best", "runtime_theme_prompt"},
+		{"select login method", "runtime_login_prompt"},
+		{"new mcp server found in this project", "mcp_approval_prompt"},
+		{"bypass permissions mode", "permission_bypass_prompt"},
+		{"opening browser to sign in", "runtime_login_prompt"},
+		{"paste code here if prompted", "runtime_login_prompt"},
+	}
+	for _, blocker := range blockers {
+		if strings.Contains(lower, blocker.needle) {
+			return blocker.detail
+		}
+	}
+	return ""
 }
 
 func wrapSandboxCommand(s config.SandboxRunner, agent, workspace string, command []string) ([]string, error) {
@@ -1122,6 +1189,11 @@ func (h *Hub) spawnCore(n *network, actor string,
 		Pane: pane, Session: session, PID: pid, StartEpoch: epoch,
 		Spawned: true, Nudge: req.Nudge, Registered: time.Now().UnixMilli(),
 	}
+	if transcript, err := startTranscript(n.name, req.Name, pane); err == nil {
+		rec.Transcript = transcript
+	} else {
+		n.auditLine(actor, "transcript", rec.Name+"@"+h.Cfg.HostName, "disabled: "+err.Error())
+	}
 	if err := n.reg.Put(rec); err != nil {
 		control.KillSession(session, pane)
 		return store.AgentRec{}, &spawnErr{500, fmt.Sprintf("registry: %v", err)}
@@ -1129,6 +1201,26 @@ func (h *Hub) spawnCore(n *network, actor string,
 	n.auditLine(actor, "spawn", rec.Name+"@"+h.Cfg.HostName,
 		fmt.Sprintf("cmd=%q grant_control=%v nudge=%v headed=%v persist=%v", strings.Join(req.Cmd, " "), req.GrantControl, req.Nudge, req.Headed, req.Persist))
 	return rec, nil
+}
+
+func startTranscript(network, agent, pane string) (string, error) {
+	dir := filepath.Join(config.Home(), "runs", network)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%s-%s.log", agent, time.Now().UTC().Format("20060102T150405.000000000Z")))
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	if err := control.StartCapture(pane, path); err != nil {
+		os.Remove(path)
+		return "", err
+	}
+	return path, nil
 }
 
 // localControllable resolves an agent arg (name or name@thishost) to a

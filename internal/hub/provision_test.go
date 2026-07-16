@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/benhynes/hive/internal/config"
@@ -21,6 +22,69 @@ func readJSONFile(t *testing.T, path string) map[string]any {
 		t.Fatalf("parse %s: %v", path, err)
 	}
 	return m
+}
+
+func TestProvisionCodexRuntimeIntoWorkspace(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cwd := filepath.Join(home, "work")
+	auth := filepath.Join(home, "auth.json")
+	if err := os.WriteFile(auth, []byte(`{"auth_mode":"chatgpt"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prof := config.SpawnProfile{
+		RuntimeSetup: &config.RuntimeSetup{Type: "codex", AuthSource: auth},
+		Sandbox:      &config.SandboxRunner{Command: "/usr/local/bin/ff", Profiles: "/etc/runner.yaml", Profile: "codex"},
+	}
+	if err := provisionAgent(cwd, prof, "/host/hive"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(cwd, ".codex", "auth.json")); err != nil || string(got) != `{"auth_mode":"chatgpt"}` {
+		t.Fatalf("codex auth = %q, %v", got, err)
+	}
+	configText, err := os.ReadFile(filepath.Join(cwd, ".codex", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(configText), `[mcp_servers.hive]`) ||
+		!strings.Contains(string(configText), `command = "/usr/local/bin/hive"`) ||
+		!strings.Contains(string(configText), `"/workspace/.hive-mcp.log"`) ||
+		!strings.Contains(string(configText), `"HIVE_AGENT"`) ||
+		!strings.Contains(string(configText), `[projects."/workspace"]`) {
+		t.Fatalf("codex config = %s", configText)
+	}
+}
+
+func TestProvisionClaudeRuntimePreapprovesSandboxWorkspace(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cwd := filepath.Join(home, "work")
+	auth := filepath.Join(home, "credentials.json")
+	state := filepath.Join(home, "claude.json")
+	if err := os.WriteFile(auth, []byte(`{"oauth":"present"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(state, []byte(`{"numStartups":7}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prof := config.SpawnProfile{
+		RuntimeSetup: &config.RuntimeSetup{
+			Type: "claude", AuthSource: auth, StateSource: state, Workspace: "/workspace",
+		},
+		Sandbox: &config.SandboxRunner{Command: "/usr/local/bin/ff", Profiles: "/etc/runner.yaml", Profile: "claude"},
+	}
+	if err := provisionAgent(cwd, prof, "/host/hive"); err != nil {
+		t.Fatal(err)
+	}
+	got := readJSONFile(t, filepath.Join(cwd, ".claude", ".claude.json"))
+	projects := got["projects"].(map[string]any)
+	entry := projects["/workspace"].(map[string]any)
+	if entry["hasTrustDialogAccepted"] != true || !contains(entry["enabledMcpjsonServers"].([]any), "hive") {
+		t.Fatalf("Claude sandbox approval = %#v", entry)
+	}
+	if _, err := os.Stat(filepath.Join(cwd, ".claude", ".credentials.json")); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestProvisionAgent(t *testing.T) {

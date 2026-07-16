@@ -49,6 +49,9 @@ func Paste(pane, text string) error { return tmux.Paste(pane, text) }
 // much scrollback.
 func Capture(pane string, lines int) (string, error) { return tmux.Capture(pane, lines) }
 
+// StartCapture retains subsequent terminal output in path.
+func StartCapture(pane, path string) error { return tmux.StartCapture(pane, path) }
+
 // KillSession terminates a session and everything in it. The pane id is
 // unused on Unix (tmux kills by session name).
 func KillSession(session, _ string) error { return tmux.KillSession(session) }

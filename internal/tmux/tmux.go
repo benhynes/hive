@@ -148,6 +148,13 @@ func Capture(pane string, lines int) (string, error) {
 	return run(a...)
 }
 
+// StartCapture appends all subsequent pane output to path. The caller creates
+// the file first so its permissions do not depend on the user's shell umask.
+func StartCapture(pane, path string) error {
+	_, err := run("pipe-pane", "-o", "-t", pane, "cat >> "+shellQuote(path))
+	return err
+}
+
 // PaneExists reports whether the pane is still alive.
 func PaneExists(pane string) bool {
 	out, err := run("display-message", "-p", "-t", pane, "#{pane_id}")

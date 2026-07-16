@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -113,6 +114,31 @@ func TestEnvInjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFile(t, out, env["HIVE_TOKEN"]+"|dev")
+}
+
+func TestStartCapture(t *testing.T) {
+	setup(t)
+	path := filepath.Join(t.TempDir(), "agent's terminal.log")
+	if err := os.WriteFile(path, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	pane, _, err := NewSession("capture", "", nil, []string{"sh", "-c", "sleep 0.2; printf transcript-marker; sleep 2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := StartCapture(pane, path); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		b, err := os.ReadFile(path)
+		if err == nil && strings.Contains(string(b), "transcript-marker") {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	b, _ := os.ReadFile(path)
+	t.Fatalf("capture did not contain marker: %q", b)
 }
 
 func TestPaneLifecycle(t *testing.T) {

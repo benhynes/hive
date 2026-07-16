@@ -44,8 +44,17 @@ func runSpawn(args []string) error {
 		fmt.Printf("  session: %s (attach: tmux attach -t %s)\n", res.Session, res.Session)
 	}
 	fmt.Printf("  pane:    %s\n", res.Pane)
+	if res.Transcript != "" {
+		fmt.Printf("  log:     %s\n", res.Transcript)
+	}
 	if *waitReady {
 		fmt.Printf("  ready:   %v\n", res.Ready)
+		if res.State != "" {
+			fmt.Printf("  state:   %s\n", res.State)
+		}
+		if res.Detail != "" {
+			fmt.Printf("  detail:  %s\n", res.Detail)
+		}
 	}
 	if *grant {
 		fmt.Printf("  control: granted (HIVE_CONTROL_TOKEN injected)\n")
