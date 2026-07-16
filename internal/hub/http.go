@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -905,22 +906,31 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 	}
 	req.Cwd = expandHome(req.Cwd)
 
+	spec := provisionSpec{}
+	if req.Provision != nil {
+		spec = *req.Provision
+	} else {
+		var err error
+		if spec, err = buildProvision(prof); err != nil {
+			httpErr(w, 500, "provision: %v", err)
+			return
+		}
+	}
+
 	// Provision the working directory (context files, .mcp.json, trust) before
 	// the runtime starts. Only when there is a cwd to write into — without one
 	// there is no project dir to seed, so a bare `spawn -- claude` is unchanged.
 	if req.Cwd != "" {
-		spec := provisionSpec{}
-		if req.Provision != nil {
-			spec = *req.Provision
-		} else {
-			var err error
-			if spec, err = buildProvision(prof); err != nil {
-				httpErr(w, 500, "provision: %v", err)
-				return
-			}
-		}
 		if err := applyProvision(req.Cwd, spec, hiveBinPath()); err != nil {
 			httpErr(w, 500, "provision: %v", err)
+			return
+		}
+	}
+	if spec.Sandbox != nil {
+		var err error
+		req.Cmd, err = wrapSandboxCommand(*spec.Sandbox, req.Name, req.Cwd, req.Cmd)
+		if err != nil {
+			httpErr(w, 400, "sandbox: %v", err)
 			return
 		}
 	}
@@ -995,6 +1005,30 @@ func (h *Hub) hSpawn(w http.ResponseWriter, r *http.Request, n *network, id iden
 		Agent: rec.Name + "@" + h.Cfg.HostName, Session: rec.Session, Pane: rec.Pane,
 		Nudge: rec.Nudge, NudgePolicy: "explicit", Ready: ready, Window: window,
 	})
+}
+
+func wrapSandboxCommand(s config.SandboxRunner, agent, workspace string, command []string) ([]string, error) {
+	if !filepath.IsAbs(s.Command) || filepath.Clean(s.Command) != s.Command {
+		return nil, fmt.Errorf("command must be a clean absolute path")
+	}
+	if !filepath.IsAbs(s.Profiles) || filepath.Clean(s.Profiles) != s.Profiles {
+		return nil, fmt.Errorf("profiles must be a clean absolute path")
+	}
+	if !proto.ValidName(s.Profile) {
+		return nil, fmt.Errorf("profile name is invalid")
+	}
+	if workspace == "" {
+		return nil, fmt.Errorf("a sandboxed spawn requires cwd")
+	}
+	workspace, err := filepath.Abs(workspace)
+	if err != nil {
+		return nil, fmt.Errorf("resolve workspace")
+	}
+	wrapped := []string{
+		s.Command, "run", "--profiles", s.Profiles, "--profile", s.Profile,
+		"--agent", agent, "--workspace", filepath.Clean(workspace), "--",
+	}
+	return append(wrapped, command...), nil
 }
 
 // declare records a spawn request as a desired session in the persist store.

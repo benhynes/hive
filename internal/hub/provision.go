@@ -19,13 +19,14 @@ type provisionSpec struct {
 	Context map[string]string           `json:"context,omitempty"` // basename -> file content
 	MCP     map[string]config.MCPServer `json:"mcp,omitempty"`
 	NoHive  bool                        `json:"no_hive_mcp,omitempty"`
+	Sandbox *config.SandboxRunner       `json:"sandbox,omitempty"`
 }
 
 // buildProvision resolves a profile into a self-contained spec, reading the
 // listed context files. A listed-but-missing file is an error — it was named
 // on purpose.
 func buildProvision(prof config.SpawnProfile) (provisionSpec, error) {
-	spec := provisionSpec{NoHive: prof.NoHiveMCP, MCP: prof.MCP}
+	spec := provisionSpec{NoHive: prof.NoHiveMCP, MCP: prof.MCP, Sandbox: prof.Sandbox}
 	if len(prof.Context) > 0 {
 		spec.Context = map[string]string{}
 		for _, src := range prof.Context {

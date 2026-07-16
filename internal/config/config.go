@@ -93,6 +93,16 @@ type SpawnProfile struct {
 	// NoHiveMCP opts out of auto-registering the `hive` MCP server. By default
 	// every provisioned agent gets it, so it is mesh-aware with zero setup.
 	NoHiveMCP bool `json:"no_hive_mcp,omitempty"`
+	// Sandbox makes containment an operator-selected property of spawning.
+	// Hive owns identity and lifecycle; the named Forcefield runner owns the
+	// isolation and external capability boundary.
+	Sandbox *SandboxRunner `json:"sandbox,omitempty"`
+}
+
+type SandboxRunner struct {
+	Command  string `json:"command"`  // absolute path to the trusted ff binary
+	Profiles string `json:"profiles"` // absolute Forcefield runner profile file
+	Profile  string `json:"profile"`  // operator-selected runner profile name
 }
 
 var profileNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
