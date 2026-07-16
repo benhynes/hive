@@ -65,7 +65,7 @@ func shellQuote(s string) string {
 // pane's id and pid in one round trip: -P -F prints both fields from the
 // create call, so callers need neither a follow-up list-panes (FirstPane)
 // nor a display-message (PanePID).
-func NewSession(session, cwd string, env map[string]string, cmd []string) (string, int, error) {
+func NewSession(session, cwd string, env map[string]string, cmd []string, transcript ...string) (string, int, error) {
 	a := []string{"new-session", "-d", "-P", "-F", "#{pane_id} #{pane_pid}", "-s", session, "-x", "220", "-y", "50"}
 	if cwd != "" {
 		a = append(a, "-c", cwd)
@@ -83,6 +83,9 @@ func NewSession(session, cwd string, env map[string]string, cmd []string) (strin
 		quoted[i] = shellQuote(c)
 	}
 	a = append(a, strings.Join(quoted, " "))
+	if len(transcript) > 0 && transcript[0] != "" {
+		a = append(a, ";", "pipe-pane", "-o", "-t", session+":", "cat >> "+shellQuote(transcript[0]))
+	}
 	out, err := run(a...)
 	if err != nil {
 		return "", 0, err
@@ -146,6 +149,13 @@ func Capture(pane string, lines int) (string, error) {
 		a = append(a, "-S", fmt.Sprintf("-%d", lines))
 	}
 	return run(a...)
+}
+
+// StartCapture appends all subsequent pane output to path. The caller creates
+// the file first so its permissions do not depend on the user's shell umask.
+func StartCapture(pane, path string) error {
+	_, err := run("pipe-pane", "-o", "-t", pane, "cat >> "+shellQuote(path))
+	return err
 }
 
 // PaneExists reports whether the pane is still alive.

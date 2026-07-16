@@ -22,13 +22,15 @@ func AllowClientPane(pane string) error { return nil }
 // returns its pane id and pid. headed is a spawn-time hint only Windows
 // needs (tmux sessions are always headless; OpenWindow attaches a terminal
 // afterwards).
-func NewSession(session, cwd string, env map[string]string, cmd []string, headed bool) (string, int, error) {
-	pane, pid, err := tmux.NewSession(session, cwd, env, cmd)
+func NewSession(session, cwd string, env map[string]string, cmd []string, headed bool, transcript ...string) (string, int, error) {
+	pane, pid, err := tmux.NewSession(session, cwd, env, cmd, transcript...)
 	if err != nil && strings.Contains(err.Error(), "duplicate session") {
 		return "", 0, fmt.Errorf("%w: %v", ErrDuplicateSession, err)
 	}
 	return pane, pid, err
 }
+
+func SupportsTranscript() bool { return true }
 
 // PaneExists reports whether the pane is still alive.
 func PaneExists(pane string) bool { return tmux.PaneExists(pane) }
@@ -48,6 +50,9 @@ func Paste(pane, text string) error { return tmux.Paste(pane, text) }
 // Capture returns the visible pane content; lines > 0 also includes that
 // much scrollback.
 func Capture(pane string, lines int) (string, error) { return tmux.Capture(pane, lines) }
+
+// StartCapture retains subsequent terminal output in path.
+func StartCapture(pane, path string) error { return tmux.StartCapture(pane, path) }
 
 // KillSession terminates a session and everything in it. The pane id is
 // unused on Unix (tmux kills by session name).

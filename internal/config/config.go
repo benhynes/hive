@@ -93,6 +93,28 @@ type SpawnProfile struct {
 	// NoHiveMCP opts out of auto-registering the `hive` MCP server. By default
 	// every provisioned agent gets it, so it is mesh-aware with zero setup.
 	NoHiveMCP bool `json:"no_hive_mcp,omitempty"`
+	// Sandbox makes containment an operator-selected property of spawning.
+	// Hive owns identity and lifecycle; the named Forcefield runner owns the
+	// isolation and external capability boundary.
+	Sandbox *SandboxRunner `json:"sandbox,omitempty"`
+	// RuntimeSetup provisions runtime-specific auth, trust, and Hive MCP
+	// configuration into the selected cwd before a sandbox starts.
+	RuntimeSetup *RuntimeSetup `json:"runtime_setup,omitempty"`
+}
+
+type RuntimeSetup struct {
+	Type            string `json:"type"`                        // codex or claude
+	AuthSource      string `json:"auth_source"`                 // trusted host credential file copied 0600
+	StateSource     string `json:"state_source,omitempty"`      // Claude state file copied and pre-approved
+	Workspace       string `json:"workspace,omitempty"`         // runtime-visible cwd; defaults to /workspace when sandboxed
+	HiveCommand     string `json:"hive_command,omitempty"`      // runtime-visible hive binary; defaults to /usr/local/bin/hive in a sandbox
+	CheckForUpdates *bool  `json:"check_for_updates,omitempty"` // Codex startup update check; nil preserves its default
+}
+
+type SandboxRunner struct {
+	Command  string `json:"command"`  // absolute path to the trusted ff binary
+	Profiles string `json:"profiles"` // absolute Forcefield runner profile file
+	Profile  string `json:"profile"`  // operator-selected runner profile name
 }
 
 var profileNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)

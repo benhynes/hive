@@ -41,6 +41,10 @@ func main() {
 		err = runNode(args)
 	case "spawn":
 		err = runSpawn(args)
+	case "team":
+		err = runTeam(args)
+	case "harness":
+		err = runHarness(args)
 	case "keys":
 		err = runKeys(args)
 	case "read":
@@ -135,8 +139,8 @@ MESSAGING is MCP-only — agents send/recv/ask/answer via the hive_* tools.
                                            hive_ask, hive_answer, hive_asks,
                                            hive_agents (+ spawn/keys/read/kill
                                            when control was explicitly granted).
-                                           Configure once in the runtime:
-                                             claude mcp add hive -- hive mcp
+                                           Installed globally into supported
+                                           runtimes by hive harness sync.
                                            --list prints the tools and exits.
 
 HOSTS (control layer)
@@ -153,7 +157,7 @@ HOSTS (control layer)
                                            bootstrap a permanent host over ssh
 
 CONTROL (control layer; goes direct to the target host)
-  hive spawn [--host H] [--cwd D] [--profile P] [--grant-control] [--wait] [--headed] [--nudge] [--persist] <name> [-- CMD...]
+  hive spawn [--host H] [--cwd D] [--profile P] [--replace] [--grant-control] [--wait] [--headed] [--nudge] [--persist] <name> [-- CMD...]
                                             --persist: daemon respawns it after reboot/crash
                                             --nudge: allow fixed terminal wake + Enter;
                                             controlled idle panes only
@@ -164,6 +168,11 @@ CONTROL (control layer; goes direct to the target host)
   hive keys [--enter] <agent> <text...>
   hive read [--lines N] <agent>
   hive kill [--forget] <agent>            --forget drops the persist declaration too
+  hive team up|status|down <name-or-manifest>
+                                            manage a manifest-defined group from
+                                            ~/.hive/teams/<name>.yaml
+  hive harness sync|status                  globally install or inspect Hive and
+                                            Forcefield across supported harnesses
 
 Config: HIVE_ADDR HIVE_NET HIVE_TOKEN HIVE_CONTROL_TOKEN HIVE_CONTROL_HOST HIVE_AGENT
         (per-host: ~/.hive/config.json; per-net: ~/.hive/nets/<net>/)

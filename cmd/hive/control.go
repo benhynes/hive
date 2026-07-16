@@ -19,6 +19,7 @@ func runSpawn(args []string) error {
 	headed := fs.Bool("headed", false, "open a visible terminal window on the target host attached to the session")
 	nudge := fs.Bool("nudge", false, "opt into automatic terminal wake + Enter (controlled idle panes only)")
 	persist := fs.Bool("persist", false, "declare the session: the daemon respawns it after reboot or crash")
+	replace := fs.Bool("replace", false, "atomically replace an existing agent with the same name")
 	fs.Parse2()
 	name := fs.pos(0)
 	cmd := fs.afterDD
@@ -31,7 +32,11 @@ func runSpawn(args []string) error {
 	if err != nil {
 		return err
 	}
-	res, err := c.SpawnWithNudge(*host, name, cmd, *cwd, *profile, *grant, *waitReady, *headed, *nudge, *persist)
+	res, err := c.SpawnWithOptions(client.SpawnOptions{
+		Host: *host, Name: name, Cmd: cmd, Cwd: *cwd, Profile: *profile,
+		GrantControl: *grant, WaitReady: *waitReady, Headed: *headed,
+		Nudge: *nudge, Persist: *persist, Replace: *replace,
+	})
 	if err != nil {
 		return err
 	}
@@ -44,8 +49,17 @@ func runSpawn(args []string) error {
 		fmt.Printf("  session: %s (attach: tmux attach -t %s)\n", res.Session, res.Session)
 	}
 	fmt.Printf("  pane:    %s\n", res.Pane)
+	if res.Transcript != "" {
+		fmt.Printf("  log:     %s\n", res.Transcript)
+	}
 	if *waitReady {
 		fmt.Printf("  ready:   %v\n", res.Ready)
+		if res.State != "" {
+			fmt.Printf("  state:   %s\n", res.State)
+		}
+		if res.Detail != "" {
+			fmt.Printf("  detail:  %s\n", res.Detail)
+		}
 	}
 	if *grant {
 		fmt.Printf("  control: granted (HIVE_CONTROL_TOKEN injected)\n")

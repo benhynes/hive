@@ -290,6 +290,27 @@ func TestSpawnPreflightsExplicitNudgePolicy(t *testing.T) {
 	}
 }
 
+func TestSpawnWithOptionsSendsReplace(t *testing.T) {
+	var spawnBody map[string]any
+	hc := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body := `{"api":"hive","v":1,"features":["explicit_nudge"]}`
+		if strings.HasSuffix(r.URL.Path, "/spawn/v2") {
+			if err := json.NewDecoder(r.Body).Decode(&spawnBody); err != nil {
+				t.Fatal(err)
+			}
+			body = `{"agent":"worker@testhost","session":"s","pane":"%1","nudge_policy":"explicit"}`
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}
+	c := &Client{Addr: "http://test", Net: "dev", Token: "msg", Control: "control", self: "testhost", hc: hc}
+	if _, err := c.SpawnWithOptions(SpawnOptions{Name: "worker", Profile: "codex", Replace: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := spawnBody["replace"].(bool); !ok || !got {
+		t.Fatalf("spawn body replace = %#v", spawnBody["replace"])
+	}
+}
+
 func TestAdvertisedNudgePolicyMismatchCleansUpOnlyMintedRegistration(t *testing.T) {
 	for _, operation := range []string{"register", "spawn"} {
 		t.Run(operation, func(t *testing.T) {

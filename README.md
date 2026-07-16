@@ -149,15 +149,21 @@ the MCP-server gate — so a headless Claude Code agent boots straight into the
 mesh with no prompt to hang on. A spawn without `--cwd` is unchanged.
 
 A **profile** (`~/.hive/profiles/<name>.json`) extends that with a default
-runtime, cwd, context files seeded into the directory, and extra MCP servers:
+runtime, cwd, context files seeded into the directory, extra MCP servers, and
+an optional operator-selected Forcefield sandbox:
 
 ```jsonc
 // ~/.hive/profiles/dev.json
 {
-  "runtime": ["claude", "--dangerously-skip-permissions"],
+  "runtime": ["/usr/local/bin/claude", "--dangerously-skip-permissions"],
   "cwd":     "~/work/agents",
   "context": ["/path/to/AGENT-GUIDE.md"],        // seeded into cwd
-  "mcp": { "playwright": { "command": "npx", "args": ["-y", "@playwright/mcp"] } }
+  "mcp": { "playwright": { "command": "npx", "args": ["-y", "@playwright/mcp"] } },
+  "sandbox": {
+    "command": "/usr/local/bin/ff",
+    "profiles": "/etc/forcefield/forcefield-runner.yaml",
+    "profile": "codex-worker"
+  }
 }
 ```
 
@@ -168,6 +174,11 @@ hive spawn --profile dev --cwd ~/x w2 -- claude   # explicit flags win
 
 Explicit flags and a trailing `-- CMD` override profile fields. Set
 `"no_hive_mcp": true` in a profile to opt out of the automatic `hive` server.
+When `sandbox` is present, Hive wraps the resolved runtime as `ff run` after it
+has selected the agent identity and workspace. Hive continues to own spawning,
+tmux, and lifecycle; Forcefield owns process isolation and external capability
+mediation. The sandbox command and profile selection come only from the trusted
+Hive profile, never from the agent prompt.
 
 ## Add a second host
 
