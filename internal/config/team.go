@@ -10,9 +10,14 @@ import (
 
 // Team is a repeatable group of agents launched from spawn profiles.
 type Team struct {
-	Name    string       `yaml:"name,omitempty"`
-	Host    string       `yaml:"host,omitempty"`
-	Members []TeamMember `yaml:"members"`
+	Name     string       `yaml:"name,omitempty"`
+	Host     string       `yaml:"host,omitempty"`
+	Defaults TeamDefaults `yaml:"defaults,omitempty"`
+	Members  []TeamMember `yaml:"members"`
+}
+
+type TeamDefaults struct {
+	Nudge *bool `yaml:"nudge,omitempty"`
 }
 
 type TeamMember struct {
@@ -20,8 +25,21 @@ type TeamMember struct {
 	Profile      string `yaml:"profile"`
 	Cwd          string `yaml:"cwd,omitempty"`
 	GrantControl bool   `yaml:"grant_control,omitempty"`
-	Nudge        bool   `yaml:"nudge,omitempty"`
+	Nudge        *bool  `yaml:"nudge,omitempty"`
 	Persist      bool   `yaml:"persist,omitempty"`
+}
+
+// NudgeFor resolves terminal-wake policy for a managed team member. Teams
+// own the panes they launch, so nudging defaults on; manifests may override
+// the default for the whole team or for an individual member.
+func (t Team) NudgeFor(member TeamMember) bool {
+	if member.Nudge != nil {
+		return *member.Nudge
+	}
+	if t.Defaults.Nudge != nil {
+		return *t.Defaults.Nudge
+	}
+	return true
 }
 
 func TeamsDir() string { return filepath.Join(Home(), "teams") }

@@ -70,7 +70,7 @@ func runTeamUp(args []string) error {
 			defer wg.Done()
 			res, err := c.SpawnWithOptions(client.SpawnOptions{
 				Host: team.Host, Name: member.Name, Cwd: member.Cwd, Profile: member.Profile,
-				GrantControl: member.GrantControl, WaitReady: true, Nudge: member.Nudge,
+				GrantControl: member.GrantControl, WaitReady: true, Nudge: team.NudgeFor(member),
 				Persist: member.Persist, Replace: !*noReplace,
 			})
 			results[i] = teamResult{member: member, spawn: res, err: err}

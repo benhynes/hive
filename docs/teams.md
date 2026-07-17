@@ -16,6 +16,8 @@ to make an existing member a conflict instead.
 ```yaml
 name: zlt
 host: debian-dev # optional; defaults to the local host
+defaults:
+  nudge: true # optional; this is already the default for managed teams
 members:
   - name: zlt-lead
     profile: zlt-lead
@@ -27,8 +29,11 @@ members:
     profile: zlt-reviewer
 ```
 
-Each member may also set `cwd`, `grant_control`, `nudge`, or `persist`.
-Transcripts are retained when members are replaced or stopped.
+Managed team members default to `nudge: true`, allowing unread Hive mail to
+wake their idle, Hive-owned panes. Set `defaults.nudge: false` to disable this
+for the whole team, or set `nudge: false` on an individual member. Each member
+may also set `cwd`, `grant_control`, or `persist`. Transcripts are retained when
+members are replaced or stopped.
 
 For unattended Codex profiles, disable the startup update prompt explicitly:
 
